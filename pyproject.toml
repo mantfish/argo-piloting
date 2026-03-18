@@ -1,0 +1,19 @@
+[project]
+name = "sim"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.0",
+    "matplotlib>=3.8",
+    "scikit-learn>=1.4",
+    "jupyter>=1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
