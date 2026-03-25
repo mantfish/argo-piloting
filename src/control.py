@@ -1,135 +1,148 @@
-"""Control strategies for the profiling float simulator.
+"""Control strategies for profiling float mission planning.
 
-This module maps strategy names to functions that decide what the float
-should do next, given its current state and a forecast of the velocity
-field ahead.
+Each strategy encapsulates the decision logic that runs at the surface between
+dive cycles. A strategy receives the current profiler state and a forecast
+window, then returns a :class:`~sim_types.ControlAction` describing the next
+cycle (park mode, depths, speeds, duration).
 
-Adding a new strategy
----------------------
-1. Implement a function with the signature::
-
-       def _my_strategy(
-           state: ProfilerState,
-           forecast: xr.Dataset,
-           current_action: ControlAction,
-       ) -> ControlAction: ...
-
-2. Register it in ``STRATEGIES``::
-
-       STRATEGIES["my_strategy"] = _my_strategy
-
-That is all. No other module needs to change.
-
-Notes
------
-- The *forecast* dataset is a small, fully computed ``xr.Dataset``
-  returned by ``get_forecast_field()``. Strategies may inspect ``uo``
-  and ``vo`` in it to inform their decision, or ignore it entirely.
-- Every strategy must return a ``ControlAction``. Return
-  *current_action* unchanged for a no-op, or build and return a new
-  instance to change behaviour for the next cycle.
-
-Imports: src/types.py only.
+To add a new strategy, subclass :class:`ControlStrategy` and implement
+:meth:`~ControlStrategy.get_action` and :meth:`~ControlStrategy.get_log`.
 """
 from __future__ import annotations
 
-from typing import Callable
+import logging
 
+import numpy as np
 import xarray as xr
 
-from sim_types import ControlAction, ProfilerState
+from sim_types import ControlAction, ControlStrategy, ProfilerState
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Registry
+# Concrete strategies
 # ---------------------------------------------------------------------------
 
-STRATEGIES: dict[str, Callable[[ProfilerState, xr.Dataset, ControlAction], ControlAction]] = {}
-"""Maps strategy name → strategy function.
 
-Populated at module load time by the registrations at the bottom of this
-file. Use :func:`get_action` to dispatch by name.
-"""
+class NoControlParkOnBottom(ControlStrategy):
+    """Passive strategy: always park on the seabed, no active steering.
+
+    The float descends until it touches the bottom, waits for the configured
+    cycle duration, then ascends. No forecast information is used.
+    """
+
+    def __init__(self) -> None:
+        self.cycle_hours = 120
+        self.name = "no_control"
+        self.default_control_action = ControlAction(
+            park_mode="park_on_bottom",
+            transmission_duration_minutes=30,
+            ascent_speed_ms=0.01,
+            descent_speed_ms=0.01,
+            cycle_hours=self.cycle_hours,
+        )
+
+    def get_action(self, **kwargs) -> ControlAction:
+        return self.default_control_action
+
+    def get_log(self) -> dict:
+        return {
+            "control_strategy": self.name,
+            "cycle_hours": self.default_control_action.cycle_hours,
+            "transmission_duration_minutes": self.default_control_action.transmission_duration_minutes,
+            "ascent_speed": self.default_control_action.ascent_speed_ms,
+            "descent_speed": self.default_control_action.descent_speed_ms,
+            "park_mode": self.default_control_action.park_mode,
+        }
 
 
-# ---------------------------------------------------------------------------
-# Public dispatch
-# ---------------------------------------------------------------------------
+class DriftTowardsPoint(ControlStrategy):
+    """Opportunistic steering: surface-drift when current points toward target.
 
-def get_action(
-    state: ProfilerState,
-    forecast: xr.Dataset,
-    current_action: ControlAction,
-    strategy: str,
-) -> ControlAction:
-    """Return the next :class:`~types.ControlAction` for the profiler.
-
-    Looks up *strategy* in :data:`STRATEGIES` and calls the corresponding
-    function. The returned action is used for the next dive cycle.
+    At each cycle the strategy samples the surface velocity from the forecast
+    and compares its bearing to the bearing toward ``target_location``. If the
+    angle between them is within ``theta_tolerance_deg``, the float drifts on
+    the surface for the cycle; otherwise it parks at depth to avoid drifting
+    the wrong way.
 
     Parameters
     ----------
-    state:
-        Current profiler state at the moment of surfacing.
-    forecast:
-        Small, fully computed ``xr.Dataset`` covering the expected
-        spatial and temporal range of the next dive, as returned by
-        ``get_forecast_field()``. Strategies may use ``uo`` / ``vo``
-        from this dataset to plan ahead, or ignore it entirely.
-    current_action:
-        The action used for the cycle that just completed. Passed to
-        the strategy so it can make incremental adjustments rather than
-        computing everything from scratch.
-    strategy:
-        Name of the control strategy to use. Must be a key in
-        :data:`STRATEGIES`.
-
-    Returns
-    -------
-    ControlAction
-        The action to execute on the next dive.
-
-    Raises
-    ------
-    ValueError
-        If *strategy* is not registered, with a message listing all
-        available strategy names.
+    target_location:
+        ``[lat, lon]`` of the destination point in decimal degrees.
     """
-    if strategy not in STRATEGIES:
-        available = ", ".join(f'"{s}"' for s in sorted(STRATEGIES))
-        raise ValueError(
-            f"Unknown control strategy {strategy!r}. Available strategies: {available}"
+
+    def __init__(self, target_location: list[float]) -> None:
+        self.target_location = target_location
+        self.cycle_hours = 120
+        self.transmission_duration_minutes = 30
+        self.theta_tolerance_deg = 60.0
+        self.ascent_speed_ms = 0.01
+        self.descent_speed_ms = 0.01
+        self.name = "drift_towards_point"
+
+        self.parking_action = ControlAction(
+            park_mode="parking_depth",
+            transmission_duration_minutes=self.transmission_duration_minutes,
+            ascent_speed_ms=self.ascent_speed_ms,
+            descent_speed_ms=self.descent_speed_ms,
+            cycle_hours=self.cycle_hours,
         )
-    return STRATEGIES[strategy](state, forecast, current_action)
+        self.drifting_action = ControlAction(
+            park_mode="drift_on_surface",
+            transmission_duration_minutes=self.transmission_duration_minutes,
+            cycle_hours=self.cycle_hours,
+        )
 
+    def get_action(self, profiler_state: ProfilerState, forecast: xr.Dataset, **kwargs) -> ControlAction:
+        """Choose park or surface-drift based on current forecast bearing.
 
-# ---------------------------------------------------------------------------
-# Strategy implementations
-# ---------------------------------------------------------------------------
+        Parameters
+        ----------
+        profiler_state:
+            Current float state (position and time used for velocity lookup).
+        forecast:
+            Forecast dataset covering at least the current position and time.
 
-def _no_control(
-    state: ProfilerState,
-    forecast: xr.Dataset,
-    current_action: ControlAction,
-) -> ControlAction:
-    """Baseline strategy: repeat the same dive parameters every cycle.
+        Returns
+        -------
+        ControlAction
+            ``drifting_action`` if the surface current points within
+            ``theta_tolerance_deg`` of the target; ``parking_action`` otherwise.
+        """
+        surface = forecast.isel(depth=0)
+        t = np.clip(
+            np.datetime64(profiler_state.time, "ns"),
+            surface.time.values[0],
+            surface.time.values[-1],
+        )
+        east_uo = float(surface["uo"].interp(time=t, latitude=profiler_state.lat, longitude=profiler_state.lon))
+        north_vo = float(surface["vo"].interp(time=t, latitude=profiler_state.lat, longitude=profiler_state.lon))
 
-    The profiler dives to the same depth, parks for the same duration,
-    and ascends on the same schedule regardless of its position or the
-    forecast. The *forecast* argument is ignored entirely.
+        theta_current = np.arctan2(east_uo, north_vo)
 
-    This is the reference case for drift experiments — it lets the float
-    go wherever the currents take it with no corrective action.
-    """
-    return current_action
+        theta_positions = np.arctan2(
+            (self.target_location[1] - profiler_state.lon) * np.cos(np.radians(profiler_state.lat)),
+            self.target_location[0] - profiler_state.lat,
+        )
 
+        theta_diff = theta_positions - theta_current
+        theta_diff = (theta_diff + np.pi) % (2 * np.pi) - np.pi  # wrap to [−π, π]
 
-def _move_towards(
-    state: ProfilerState,
-    forecast: xr.Dataset,
-    current_action: ControlAction,
-) -> ControlAction:
-    """If  move towards it"""
+        if np.abs(theta_diff) <= self.theta_tolerance_deg * np.pi / 180:
+            logger.info("Angle is %s, therefore drifting towards location for %d hours", theta_diff, self.cycle_hours)
+            return self.drifting_action
+        else:
+            logger.info("Angle is %s, therefore parking on bottom for %d hours", theta_diff, self.cycle_hours)
+            return self.parking_action
 
-
-STRATEGIES["no_control"] = _no_control
+    def get_log(self) -> dict:
+        return {
+            "control_strategy": self.name,
+            "cycle_hours": self.cycle_hours,
+            "target_location": self.target_location,
+            "theta_tolerance_deg": self.theta_tolerance_deg,
+            "transmission_duration_minutes": self.transmission_duration_minutes,
+            "ascent_speed": self.ascent_speed_ms,
+            "descent_speed": self.descent_speed_ms,
+        }

@@ -343,22 +343,22 @@ if __name__ == "__main__":
 
     getter = CopernicusDataGetter()
 
-    bbox = BoundingBox(min_lat=54, max_lat=56, min_lon=12.0, max_lon=16.0,
+    bbox = BoundingBox(min_lat=53, max_lat=59, min_lon=11.0, max_lon=26.0,
                        min_depth=0.5016462206840515, max_depth=90.0)
 
     request = SubsetRequest(
         dataset_id="cmems_mod_bal_phy_anfc_PT1H-i",
         variables=["uo", "vo"],
         bbox=bbox,
-        start_datetime="2025-01-01T00:00:00",
+        start_datetime="2023-01-01T00:00:00",
         end_datetime="2025-12-31T23:59:59",
-        output_dir=Path("data/raw"),
+        output_dir=Path("data/raw2"),
         output_filename="baltic2025.nc",
     )
 
     # Do both at once — 4 years × 4 tiles = 48 downloads, merged at the end
     ds = getter.subset_chunked(
         request,
-        ChunkStrategy(temporal="monthly", lat_tiles=4, lon_tiles=4),
+        ChunkStrategy(temporal="monthly", lat_tiles=10, lon_tiles=10),
         merge=False,
     )

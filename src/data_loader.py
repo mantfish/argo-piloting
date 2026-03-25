@@ -7,6 +7,8 @@ Imports from src/types.py only.
 """
 from __future__ import annotations
 
+from typing import Callable
+
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -174,13 +176,13 @@ def load_bathymetry(gebco_path: Path) -> xr.Dataset:
 
 def build_velocity_interpolator(
     ds: xr.Dataset,
-) -> tuple[RegularGridInterpolator, RegularGridInterpolator]:
+) -> tuple[Callable, Callable]:
     """Build fast scipy interpolators for uo and vo from an in-memory dataset.
 
-    Converts the xarray working window into a pair of
-    ``RegularGridInterpolator`` objects (one per velocity component) that
-    can be queried thousands of times per dive cycle at negligible cost —
-    far faster than calling ``xr.Dataset.interp`` on every timestep.
+    Converts the xarray working window into a pair of callables (one per
+    velocity component) that can be queried thousands of times per dive
+    cycle at negligible cost. Out-of-bounds points are clamped to the
+    nearest grid edge rather than returning NaN.
 
     Parameters
     ----------
@@ -189,19 +191,29 @@ def build_velocity_interpolator(
 
     Returns
     -------
-    tuple[RegularGridInterpolator, RegularGridInterpolator]
+    tuple[Callable, Callable]
         ``(interp_u, interp_v)`` — call each with a ``[[t_s, depth, lat, lon]]``
         array where *t_s* is seconds since the Unix epoch.
     """
-    times  = ds.time.values.astype("datetime64[s]").astype(np.float64)
-    depths = ds.depth.values.astype(np.float64)
-    lats   = ds.latitude.values.astype(np.float64)
-    lons   = ds.longitude.values.astype(np.float64)
+    grid = (
+        ds.time.values.astype("datetime64[s]").astype(np.float64),
+        ds.depth.values.astype(np.float64),
+        ds.latitude.values.astype(np.float64),
+        ds.longitude.values.astype(np.float64),
+    )
+    bounds_lo = np.array([ax[0]  for ax in grid])
+    bounds_hi = np.array([ax[-1] for ax in grid])
 
-    kw = dict(method="linear", bounds_error=False, fill_value=np.nan)
-    interp_u = RegularGridInterpolator((times, depths, lats, lons), ds["uo"].values.astype(np.float64), **kw)
-    interp_v = RegularGridInterpolator((times, depths, lats, lons), ds["vo"].values.astype(np.float64), **kw)
-    return interp_u, interp_v
+    def _make_interp(data: np.ndarray) -> Callable:
+        lin = RegularGridInterpolator(grid, data, method="linear", bounds_error=False, fill_value=np.nan)
+        def _interp(xi) -> np.ndarray:
+            return lin(np.clip(np.asarray(xi, dtype=np.float64), bounds_lo, bounds_hi))
+        return _interp
+
+    return (
+        _make_interp(ds["uo"].values.astype(np.float64)),
+        _make_interp(ds["vo"].values.astype(np.float64)),
+    )
 
 
 def build_bathymetry_interpolator(bathy_ds: xr.Dataset):

@@ -23,13 +23,13 @@ logger = logging.getLogger(__name__)
 _MAX_SIMULATED_DAYS = 365
 
 
-def run_until_surface(
+def run_until_next_action(
     state: ProfilerState,
     data_dir: Path,
     manifest: list[dict],
     bathy_interp,
     action: ControlAction,
-    dt_seconds: float = 60.0,
+    dt_seconds: float = 600.0,
     spatial_margin_deg: float = 0.5,
     reload_margin_deg: float = 0.2,
 ) -> tuple[list[TrajectoryRecord], ProfilerState]:
@@ -74,35 +74,27 @@ def run_until_surface(
         If the float has not surfaced after
         ``_MAX_SIMULATED_DAYS`` of simulated time (catches runaway loops).
     """
-    if state.phase != "at_surface":
-        raise ValueError(f"run_until_surface expects phase='at_surface', got {state.phase!r}")
+    if state.phase != "communicating":
+        raise ValueError(f"run_until_surface expects phase='communicating', got {state.phase!r}")
 
     time = state.time
+    next_action_time = time + timedelta(hours=action.cycle_hours)
     lat = state.lat
     lon = state.lon
     depth = state.depth
     x = state.x
     y = state.y
-
-    phase: Phase = "descending"
-    dive_start = time
-    ascent_start_time: datetime | None = None
-
+    phase = state.phase
     # Estimate the dive window end time so we can load a working window
     # into memory once upfront, avoiding repeated lazy reads during the loop.
-    max_depth_m = (
-        action.target_depth
-        if (action.park_mode == "parking_depth" and action.target_depth is not None)
-        else 500.0  # conservative upper bound for park_on_bottom
-    )
     window_end = (
-        dive_start
+        time
         + timedelta(hours=action.cycle_hours)
-        + timedelta(seconds=(max_depth_m / action.descent_speed_ms) + (max_depth_m / action.ascent_speed_ms))
-        + timedelta(hours=6)  # safety buffer
+        + timedelta(hours=12)  # safety buffer
     )
-    lazy_ds = select_tiles(manifest, data_dir, lat, lon, dive_start, window_end, spatial_margin_deg)
-    working_ds = load_working_window(lazy_ds, lat, lon, start_time=dive_start, end_time=window_end,
+
+    lazy_ds = select_tiles(manifest, data_dir, lat, lon, time, window_end, spatial_margin_deg)
+    working_ds = load_working_window(lazy_ds, lat, lon, start_time=time, end_time=window_end,
                                      spatial_margin_deg=spatial_margin_deg)
     interp_u, interp_v = build_velocity_interpolator(working_ds)
 
@@ -114,13 +106,35 @@ def run_until_surface(
     wlat_min, wlat_max, wlon_min, wlon_max = _win_bounds(lat, lon)
 
     records: list[TrajectoryRecord] = []
-    deadline = dive_start + timedelta(days=_MAX_SIMULATED_DAYS)
+    deadline = time + timedelta(days=_MAX_SIMULATED_DAYS)
+
+    # Simulate drift durfing tranmission window
+    # TODO is less than one hour assumed therefore can do big timestep jump
+    logger.info("Simulating drift during transmission window")
+    t_s = np.datetime64(time, "s").astype(np.float64)
+    u_surface = float(interp_u([[t_s, depth, lat, lon]])[0])
+    v_surface = float(interp_v([[t_s, depth, lat, lon]])[0])
+    dx_m = u_surface * action.transmission_duration_minutes * 60.0
+    dy_m = v_surface * action.transmission_duration_minutes * 60.0
+    lat += dy_m / 111320.0
+    lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
+    x += dx_m
+    y += dy_m
+    records.append(TrajectoryRecord(
+        time=time, lat=lat, lon=lon, x=x, y=y,
+        depth=depth, phase=phase, u=u_surface, v=v_surface,
+        bathymetry_depth=np.nan, on_seabed=False,
+    ))
+    logger.info("Simulated drift to %.1f m, %.1f m, drifted for %.1f minutes", x, y, action.transmission_duration_minutes)
+
+    phase = _start_action(action, phase)
+
 
     while True:
         if time > deadline:
             raise RuntimeError(
                 f"Float has not surfaced after {_MAX_SIMULATED_DAYS} simulated days "
-                f"(dive started {dive_start}). Check your ControlAction configuration."
+                f"(action started {time}). Check your ControlAction configuration."
             )
 
         # --- velocity lookup via pre-built scipy interpolator ---
@@ -142,23 +156,23 @@ def run_until_surface(
         y += dy_m
 
         # --- vertical update and phase transitions ---
-        phase, depth, ascent_start_time = _step_phase(
+        phase, depth = _step_phase(
             phase=phase, depth=depth, bathy_depth=bathy_depth,
             action=action, time=time, dt_seconds=dt_seconds,
-            ascent_start_time=ascent_start_time,
+            next_action_time = next_action_time
         )
         time += timedelta(seconds=dt_seconds)
 
         # Float on seabed is stationary — skip ahead to ascent rather than
         # stepping through every minute of park time.
         if phase == "on_seabed":
-            print(f"  {time:%Y-%m-%d %H:%M}  {'on_seabed':<12}  lat={lat:+.4f}  lon={lon:+.4f}  x={x:+8.0f}m  y={y:+8.0f}m  depth={depth:6.1f}m  [fast-forward to {ascent_start_time:%Y-%m-%d %H:%M}]")
+            print(f"  {time:%Y-%m-%d %H:%M}  {'on_seabed':<12}  lat={lat:+.4f}  lon={lon:+.4f}  x={x:+8.0f}m  y={y:+8.0f}m  depth={depth:6.1f}m  [fast-forward to {next_action_time:%Y-%m-%d %H:%M}]")
             records.append(TrajectoryRecord(
                 time=time, lat=lat, lon=lon, x=x, y=y,
                 depth=depth, phase="on_seabed", u=u, v=v,
                 bathymetry_depth=bathy_depth, on_seabed=True,
             ))
-            time = ascent_start_time
+            time = next_action_time
             phase = "ascending"
             continue
 
@@ -170,7 +184,7 @@ def run_until_surface(
             bathymetry_depth=bathy_depth, on_seabed=(phase == "on_seabed"),
         ))
 
-        if phase == "at_surface":
+        if phase == "communicating":
             break
 
         # --- reload tiles if float nears working window edge ---
@@ -190,17 +204,14 @@ def run_until_surface(
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _ascent_start_from_parking_depth(
-    park_reached_time: datetime,
-    action: ControlAction,
-) -> datetime:
-    """Return the datetime at which ascent should begin.
+def _start_action(action: ControlAction, current_phase: Phase) -> Phase:
+    if current_phase == "communicating":
+        if action.park_mode in ("parking_depth", "park_on_bottom"):
+            return "descending"
+        elif action.park_mode == "drift_on_surface":
+            return "drift_on_surface"
+    raise ValueError(f"Invalid phase {current_phase!r} for action {action!r}")
 
-    ``cycle_hours`` is measured from the moment the float reaches its
-    parking depth or the seabed — so ascent begins exactly that many hours
-    after *park_reached_time*.
-    """
-    return park_reached_time + timedelta(hours=action.cycle_hours)
 
 
 def _step_phase(
@@ -210,9 +221,9 @@ def _step_phase(
     action: ControlAction,
     time: datetime,
     dt_seconds: float,
-    ascent_start_time: datetime | None,
+    next_action_time: datetime | None,
 ) -> tuple[Phase, float, datetime | None]:
-    """Apply one timestep of vertical dynamics and return updated (phase, depth, ascent_start_time)."""
+    """Apply one timestep of vertical dynamics and return updated (phase, depth)."""
 
     if phase == "descending":
         depth += action.descent_speed_ms * dt_seconds
@@ -220,19 +231,17 @@ def _step_phase(
         if depth >= bathy_depth:
             depth = bathy_depth
             phase = "on_seabed"
-            ascent_start_time = _ascent_start_from_parking_depth(time, action)
-            logger.debug("Float hit seabed at %.1f m; ascent starts %s", depth, ascent_start_time)
+            logger.debug("Float hit seabed at %.1f m; ascent starts %s", depth, next_action_time)
 
         elif action.park_mode == "parking_depth" and action.target_depth is not None and depth >= action.target_depth:
             depth = action.target_depth
             phase = "parking"
-            ascent_start_time = _ascent_start_from_parking_depth(time, action)
-            logger.debug("Float reached parking depth %.1f m; ascent starts %s", depth, ascent_start_time)
+            logger.debug("Float reached parking depth %.1f m; ascent starts %s", depth, next_action_time)
 
         # park_on_bottom with no seabed hit yet: keep descending, no action needed.
 
     elif phase in ("parking", "on_seabed"):
-        if ascent_start_time is not None and time >= ascent_start_time:
+        if next_action_time is not None and time >= next_action_time:
             phase = "ascending"
             logger.debug("Float beginning ascent from %.1f m at %s", depth, time)
 
@@ -240,6 +249,12 @@ def _step_phase(
         depth -= action.ascent_speed_ms * dt_seconds
         if depth <= 0.0:
             depth = 0.0
-            phase = "at_surface"
+            phase = "communicating"
 
-    return phase, depth, ascent_start_time
+    elif phase == "drift_on_surface":
+        if time >= next_action_time:
+            phase = "communicating"
+            logger.debug("Float has started coummnicating at %s", time)
+
+
+    return phase, depth
