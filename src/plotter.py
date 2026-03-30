@@ -156,6 +156,7 @@ def plot_trajectory(
     return fig
 
 
+
 def animate_trajectory(
     df: pd.DataFrame,
     ds: xr.Dataset,

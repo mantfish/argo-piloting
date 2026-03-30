@@ -87,7 +87,7 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
         )
 
         # Ask the control module what to do next.
-        action = control_strategy.get_action(
+        action = control.get_action(
             profiler_state=state,
             forecast=forecast,
         )
@@ -190,7 +190,8 @@ if __name__ == "__main__":
         phase="communicating",
     )
 
-    control_strategy = DriftTowardsPoint(target_location=[56,16])
+    #control_strategy = DriftTowardsPoint(target_location=[54.8,14.4], debug=True)
+    control_strategy = NoControlParkOnBottom(debug = True)
 
     config = SimConfig(
         start_state=start_state,
