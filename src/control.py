@@ -33,8 +33,8 @@ class NoControlParkOnBottom(ControlStrategy):
     cycle duration, then ascends. No forecast information is used.
     """
 
-    def __init__(self, debug = False) -> None:
-        self.cycle_hours = 120
+    def __init__(self, cycle_hours = 120, debug = False) -> None:
+        self.cycle_hours = cycle_hours
         self.name = "no_control"
         self.default_control_action = ControlAction(
             park_mode="park_on_bottom",
@@ -67,7 +67,7 @@ class NoControlParkOnBottom(ControlStrategy):
             ``[lat, lon]`` of the float's current position.
         """
         lat, lon = current_location
-        self.ax.scatter(lon, lat, color="blue", s=80, zorder=5)
+        self.ax.plot(lon, lat, "o", color="blue", markersize=8, zorder=5)
         self.ax.relim()
         self.ax.autoscale_view()
         self.fig.canvas.draw()

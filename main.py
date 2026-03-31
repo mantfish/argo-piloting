@@ -191,17 +191,17 @@ if __name__ == "__main__":
     )
 
     #control_strategy = DriftTowardsPoint(target_location=[54.8,14.4], debug=True)
-    control_strategy = NoControlParkOnBottom(debug = True)
+    control_strategy = NoControlParkOnBottom(cycle_hours=12, debug = True)
 
     config = SimConfig(
         start_state=start_state,
-        end_time=datetime(2025, 12, 15, 0, 0, 0),
+        end_time=datetime(2025, 1, 24, 0, 0, 0),
         control_strategy=control_strategy,
         forecast_noise_std=0.0,
         forecast_noise_seed=42,
         forecast_horizon_hours=120,
-        data_dir=Path("data/raw"),
-        output_dir=Path("data/processed/move_towards"),
+        data_dir=Path("data/test_data"),
+        output_dir=Path("data/processed/test_data"),
     )
 
     df = run_simulation(config)
