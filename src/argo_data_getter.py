@@ -2,7 +2,7 @@ import argopy
 from argopy import DataFetcher as ArgoDataFetcher
 import os
 
-WMO = 4903784  # replace with your float WMO number
+WMO = 7902194  # replace with your float WMO number
 
 print(f"Fetching all data for float {WMO}...")
 
@@ -10,7 +10,7 @@ loader = ArgoDataFetcher(src="erddap").float(WMO)
 ds = loader.to_xarray()
 ds = ds.argo.point2profile()
 
-out_dir = f"./raw/argo_data/argo_{WMO}"
+out_dir = os.path.expanduser(f"~/Documents/argo_piloting/sim/data/argo_data/argo_{WMO}")
 os.makedirs(out_dir, exist_ok=True)
 
 out_path = os.path.join(out_dir, f"{WMO}_profiles.nc")

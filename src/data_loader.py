@@ -142,7 +142,21 @@ def select_tiles(
             "Float may have left the dataset domain."
         )
 
-    logger.debug("select_tiles: loading %d tile(s) for lat=%.3f lon=%.3f", len(paths), lat, lon)
+    logger.debug(
+        "select_tiles: %d tile(s) selected for lat=%.3f lon=%.3f "
+        "window=[%s → %s] margin=%.2f°",
+        len(paths), lat, lon, start_time, end_time, spatial_margin_deg,
+    )
+    for entry in manifest:
+        p = data_dir / entry["file"]
+        if p in paths:
+            logger.debug(
+                "  tile %s | lat=[%.3f, %.3f] lon=[%.3f, %.3f] time=[%s → %s]",
+                entry["file"],
+                entry["lat"][0], entry["lat"][1],
+                entry["lon"][0], entry["lon"][1],
+                entry["time"][0], entry["time"][1],
+            )
     ds = xr.open_mfdataset(paths, combine="by_coords")
     drop = [v for v in ds.data_vars if v not in ("uo", "vo")]
     if drop:
@@ -298,6 +312,21 @@ def load_working_window(
         start_time, end_time,
         {v: window[v].shape for v in window.data_vars},
     )
+    for var in ("uo", "vo"):
+        arr = window[var].values
+        nan_frac = np.isnan(arr).mean()
+        if nan_frac == 1.0:
+            logger.warning(
+                "Working window for %s is entirely NaN at lat=%.3f lon=%.3f — "
+                "tile may be fully masked (coastal/land area)",
+                var, lat, lon,
+            )
+        elif nan_frac > 0.5:
+            logger.warning(
+                "Working window for %s is %.0f%% NaN at lat=%.3f lon=%.3f — "
+                "many velocity lookups will default to 0",
+                var, nan_frac * 100, lat, lon,
+            )
     return window
 
 

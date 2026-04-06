@@ -29,7 +29,9 @@ def run_until_next_action(
     manifest: list[dict],
     bathy_interp,
     action: ControlAction,
-    dt_seconds: float = 600.0,
+    dt_vertical_seconds: float = 30.0,
+    dt_parking_seconds: float = 3000.0,
+    dt_surface_seconds: float = 120.0,
     spatial_margin_deg: float = 0.5,
     reload_margin_deg: float = 0.2,
 ) -> tuple[list[TrajectoryRecord], ProfilerState]:
@@ -53,8 +55,10 @@ def run_until_next_action(
     action:
         Control instruction for this cycle (speeds, park mode, depths,
         cycle duration).
-    dt_seconds:
-        Integration timestep in seconds. Default 600 s (10 min).
+    dt_vertical_seconds:
+        Integration timestep in seconds for descent and ascent phases. Default 600 s (10 min).
+    dt_parking_seconds:
+        Integration timestep in seconds for parking and surface-drift phases. Default 3600 s (1 hr).
     spatial_margin_deg:
         Spatial padding in degrees used for tile selection and working
         window slicing. Default 1.0°.
@@ -77,8 +81,8 @@ def run_until_next_action(
     if state.phase != "communicating":
         raise ValueError(f"run_until_surface expects phase='communicating', got {state.phase!r}")
 
-    time = state.time
-    next_action_time = time + timedelta(hours=action.cycle_hours)
+    start_time = state.time
+    next_action_time = start_time + timedelta(hours=action.cycle_hours)
     lat = state.lat
     lon = state.lon
     depth = state.depth
@@ -88,13 +92,13 @@ def run_until_next_action(
     # Estimate the dive window end time so we can load a working window
     # into memory once upfront, avoiding repeated lazy reads during the loop.
     window_end = (
-        time
+        start_time
         + timedelta(hours=action.cycle_hours)
         + timedelta(hours=12)  # safety buffer
     )
 
-    lazy_ds = select_tiles(manifest, data_dir, lat, lon, time, window_end, spatial_margin_deg)
-    working_ds = load_working_window(lazy_ds, lat, lon, start_time=time, end_time=window_end,
+    lazy_ds = select_tiles(manifest, data_dir, lat, lon, start_time, window_end, spatial_margin_deg)
+    working_ds = load_working_window(lazy_ds, lat, lon, start_time=start_time, end_time=window_end,
                                      spatial_margin_deg=spatial_margin_deg)
     interp_u, interp_v = build_velocity_interpolator(working_ds)
 
@@ -106,26 +110,32 @@ def run_until_next_action(
     wlat_min, wlat_max, wlon_min, wlon_max = _win_bounds(lat, lon)
 
     records: list[TrajectoryRecord] = []
-    deadline = time + timedelta(days=_MAX_SIMULATED_DAYS)
+    deadline = start_time + timedelta(days=_MAX_SIMULATED_DAYS)
+    _nan_vel_count = 0
+    _NAN_VEL_SEABED_THRESHOLD = 5
 
     # Simulate drift durfing tranmission window
     # TODO is less than one hour assumed therefore can do big timestep jump
     logger.info("Simulating drift during transmission window")
-    t_s = np.datetime64(time, "s").astype(np.float64)
-    u_surface = float(interp_u([[t_s, depth, lat, lon]])[0])
-    v_surface = float(interp_v([[t_s, depth, lat, lon]])[0])
-    dx_m = u_surface * action.transmission_duration_minutes * 60.0
-    dy_m = v_surface * action.transmission_duration_minutes * 60.0
-    lat += dy_m / 111320.0
-    lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
-    x += dx_m
-    y += dy_m
-    records.append(TrajectoryRecord(
-        time=time, lat=lat, lon=lon, x=x, y=y,
-        depth=depth, phase=phase, u=u_surface, v=v_surface,
-        bathymetry_depth=np.nan, on_seabed=False,
-    ))
-    logger.info("Simulated drift to %.1f m, %.1f m, drifted for %.1f minutes", x, y, action.transmission_duration_minutes)
+    time = start_time
+
+    while time < start_time + timedelta(minutes = action.transmission_duration_minutes):
+        t_s = np.datetime64(time, "s").astype(np.float64)
+        u_surface = float(interp_u([[t_s, depth, lat, lon]])[0])
+        v_surface = float(interp_v([[t_s, depth, lat, lon]])[0])
+        dx_m = u_surface * dt_surface_seconds
+        dy_m = v_surface * dt_surface_seconds
+        lat += dy_m / 111320.0
+        lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
+        x += dx_m
+        y += dy_m
+        records.append(TrajectoryRecord(
+            time=time, lat=lat, lon=lon, x=x, y=y,
+            depth=depth, phase=phase, u=u_surface, v=v_surface,
+            bathymetry_depth=np.nan, on_seabed=False,
+        ))
+        time += timedelta(seconds=dt_vertical_seconds)
+        logger.info("Simulated surface drift to %.1f m, %.1f m, drifted for %.1f minutes", x, y, (time - start_time).total_seconds() / 60.0)
 
     phase = _start_action(action, phase)
 
@@ -137,19 +147,43 @@ def run_until_next_action(
                 f"(action started {time}). Check your ControlAction configuration."
             )
 
+        # Select timestep based on phase
+        if phase in ("parking", "on_seabed"):
+            dt = dt_parking_seconds
+        elif phase == "drift_on_surface":
+            dt = dt_surface_seconds
+        else:
+            dt = dt_vertical_seconds
+
         # --- velocity lookup via pre-built scipy interpolator ---
         t_s = np.datetime64(time, "s").astype(np.float64)
         u = float(interp_u([[t_s, depth, lat, lon]])[0])
         v = float(interp_v([[t_s, depth, lat, lon]])[0])
-        if np.isnan(u) or np.isnan(v):
-            logger.warning("NaN velocity at lat=%.4f lon=%.4f depth=%.1f time=%s — defaulting to 0", lat, lon, depth, time)
-            u, v = 0.0, 0.0
-
         bathy_depth = bathy_interp(lat, lon)
+        if np.isnan(u) or np.isnan(v):
+            logger.warning("NaN velocity at lat=%.4f lon=%.4f depth=%.1f bathy=%.1f time=%s — defaulting to 0 during phase %s",
+                           lat, lon, depth, bathy_depth, time, phase)
+            u, v = 0.0, 0.0
+            if phase in ("parking", "on_seabed"):
+                _nan_vel_count += 1
+                if _nan_vel_count >= _NAN_VEL_SEABED_THRESHOLD:
+                    logger.warning("5 consecutive NaN velocities at depth=%.1f (bathy=%.1f) during phase %s — treating as on_seabed and skipping to %s",
+                                   depth, bathy_depth, phase, next_action_time)
+
+                    records.append(TrajectoryRecord(
+                        time=time, lat=lat, lon=lon, x=x, y=y,
+                        depth=depth, phase="on_seabed", u=u, v=v,
+                        bathymetry_depth=bathy_depth, on_seabed=True,
+                    ))
+                    time = next_action_time
+                    phase = "ascending"
+                    continue
+        else:
+            _nan_vel_count = 0
 
         # --- horizontal update (forward Euler) ---
-        dx_m = u * dt_seconds
-        dy_m = v * dt_seconds
+        dx_m = u * dt
+        dy_m = v * dt
         lat += dy_m / 111320.0
         lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
         x += dx_m
@@ -158,15 +192,15 @@ def run_until_next_action(
         # --- vertical update and phase transitions ---
         phase, depth = _step_phase(
             phase=phase, depth=depth, bathy_depth=bathy_depth,
-            action=action, time=time, dt_seconds=dt_seconds,
+            action=action, time=time, dt_seconds=dt,
             next_action_time = next_action_time
         )
-        time += timedelta(seconds=dt_seconds)
+        time += timedelta(seconds=dt)
 
         # Float on seabed is stationary — skip ahead to ascent rather than
         # stepping through every minute of park time.
         if phase == "on_seabed":
-            print(f"  {time:%Y-%m-%d %H:%M}  {'on_seabed':<12}  lat={lat:+.4f}  lon={lon:+.4f}  x={x:+8.0f}m  y={y:+8.0f}m  depth={depth:6.1f}m  [fast-forward to {next_action_time:%Y-%m-%d %H:%M}]")
+            logger.debug(f"  {time:%Y-%m-%d %H:%M}  {'on_seabed':<12}  lat={lat:+.4f}  lon={lon:+.4f}  x={x:+8.0f}m  y={y:+8.0f}m  depth={depth:6.1f}m  [fast-forward to {next_action_time:%Y-%m-%d %H:%M}]")
             records.append(TrajectoryRecord(
                 time=time, lat=lat, lon=lon, x=x, y=y,
                 depth=depth, phase="on_seabed", u=u, v=v,
@@ -176,7 +210,7 @@ def run_until_next_action(
             phase = "ascending"
             continue
 
-        print(f"  {time:%Y-%m-%d %H:%M}  {phase:<12}  lat={lat:+.4f}  lon={lon:+.4f}  x={x:+8.0f}m  y={y:+8.0f}m  depth={depth:6.1f}m")
+        logger.debug(f"  {time:%Y-%m-%d %H:%M}  {phase:<12}  lat={lat:+.4f}  lon={lon:+.4f}  x={x:+8.0f}m  y={y:+8.0f}m  depth={depth:6.1f}m")
 
         records.append(TrajectoryRecord(
             time=time, lat=lat, lon=lon, x=x, y=y,
