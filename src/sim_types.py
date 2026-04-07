@@ -102,3 +102,4 @@ class SimConfig:
     forecast_horizon_hours: float # Forecast horizon in hours.
     data_dir: Path              # Directory containing the NetCDF tiles from data_getter.
     output_dir: Path            # Destination for trajectory parquet files and plots.
+    use_rk4: bool = True        # Use RK4 integration for horizontal advection (default). False falls back to forward Euler.

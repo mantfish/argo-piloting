@@ -91,3 +91,15 @@ Shared type definitions used across all modules:
 | `TrajectoryRecord` | One row of the recorded trajectory: time, lat, lon, x, y, depth, phase, u/v velocity (m/s), seabed depth, and whether the float is on the seabed. |
 | `ControlStrategy` | Abstract base class for control strategies (see `control.py`). |
 | `SimConfig` | Top-level simulation configuration: `start_state`, `end_time`, `control_strategy`, forecast noise parameters, forecast horizon, data directory, output directory. |
+
+The notebook in `/notebooks` is the backbone for validating simulation performance against real Argo float data. The workflow is:
+
+1. Download trajectory and measurement data for a float from the Argo database.
+2. Build a YAML file of *actions* (one per dive cycle) from the downloaded data.
+3. Run the simulation using those actions. Simulations can either be re-initialised at each surfacing position, or chained across N consecutive cycles without resetting position.
+4. Plot position errors between the simulated and observed trajectories.
+
+Ascent and descent speeds are taken as the mean speed observed during each phase. Surface duration is calculated from the time between the last GPS fix of one cycle and the first GPS fix of the next.
+
+**Known limitation:** the simulated float surfaces and descends with a slight timing offset relative to the real float.
+

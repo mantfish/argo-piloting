@@ -103,7 +103,7 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
 
         # Run particle simulation for one cycle.
         try:
-            records, state = run_until_next_action(state, config.data_dir, manifest, bathy_interp, action)
+            records, state = run_until_next_action(state, config.data_dir, manifest, bathy_interp, action, use_rk4=config.use_rk4)
         except RuntimeError as e:
             logger.warning("Stopping simulation early: %s", e)
             break

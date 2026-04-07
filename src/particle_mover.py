@@ -34,6 +34,7 @@ def run_until_next_action(
     dt_surface_seconds: float = 120.0,
     spatial_margin_deg: float = 0.5,
     reload_margin_deg: float = 0.2,
+    use_rk4: bool = True,
 ) -> tuple[list[TrajectoryRecord], ProfilerState]:
     """Step a profiling float through one full dive cycle.
 
@@ -123,18 +124,27 @@ def run_until_next_action(
         t_s = np.datetime64(time, "s").astype(np.float64)
         u_surface = float(interp_u([[t_s, depth, lat, lon]])[0])
         v_surface = float(interp_v([[t_s, depth, lat, lon]])[0])
-        dx_m = u_surface * dt_surface_seconds
-        dy_m = v_surface * dt_surface_seconds
-        lat += dy_m / 111320.0
-        lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
-        x += dx_m
-        y += dy_m
+        if use_rk4:
+            dlat, dlon, dx_m, dy_m = _rk4_horizontal_step(
+                interp_u, interp_v, time, dt_surface_seconds, depth, phase, action, lat, lon
+            )
+            lat += dlat
+            lon += dlon
+            x += dx_m
+            y += dy_m
+        else:
+            dx_m = u_surface * dt_surface_seconds
+            dy_m = v_surface * dt_surface_seconds
+            lat += dy_m / 111320.0
+            lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
+            x += dx_m
+            y += dy_m
         records.append(TrajectoryRecord(
             time=time, lat=lat, lon=lon, x=x, y=y,
             depth=depth, phase=phase, u=u_surface, v=v_surface,
             bathymetry_depth=np.nan, on_seabed=False,
         ))
-        time += timedelta(seconds=dt_vertical_seconds)
+        time += timedelta(seconds=dt_surface_seconds)
         logger.info("Simulated surface drift to %.1f m, %.1f m, drifted for %.1f minutes", x, y, (time - start_time).total_seconds() / 60.0)
 
     phase = _start_action(action, phase)
@@ -181,13 +191,22 @@ def run_until_next_action(
         else:
             _nan_vel_count = 0
 
-        # --- horizontal update (forward Euler) ---
-        dx_m = u * dt
-        dy_m = v * dt
-        lat += dy_m / 111320.0
-        lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
-        x += dx_m
-        y += dy_m
+        # --- horizontal update ---
+        if use_rk4:
+            dlat, dlon, dx_m, dy_m = _rk4_horizontal_step(
+                interp_u, interp_v, time, dt, depth, phase, action, lat, lon
+            )
+            lat += dlat
+            lon += dlon
+            x += dx_m
+            y += dy_m
+        else:
+            dx_m = u * dt
+            dy_m = v * dt
+            lat += dy_m / 111320.0
+            lon += dx_m / (111320.0 * math.cos(math.radians(lat)))
+            x += dx_m
+            y += dy_m
 
         # --- vertical update and phase transitions ---
         phase, depth = _step_phase(
@@ -237,6 +256,79 @@ def run_until_next_action(
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
+
+def _query_velocity(
+    interp_u,
+    interp_v,
+    t: datetime,
+    depth: float,
+    lat: float,
+    lon: float,
+) -> tuple[float, float]:
+    """Query interpolated (u, v) at a single point, returning (0, 0) for NaN."""
+    t_s = np.datetime64(t, "s").astype(np.float64)
+    u = float(interp_u([[t_s, depth, lat, lon]])[0])
+    v = float(interp_v([[t_s, depth, lat, lon]])[0])
+    if math.isnan(u) or math.isnan(v):
+        return 0.0, 0.0
+    return u, v
+
+
+def _rk4_horizontal_step(
+    interp_u,
+    interp_v,
+    t: datetime,
+    dt: float,
+    depth: float,
+    phase: Phase,
+    action: ControlAction,
+    lat: float,
+    lon: float,
+) -> tuple[float, float, float, float]:
+    """Compute horizontal displacement via RK4, returning (dlat, dlon, dx_m, dy_m).
+
+    Vertical depth at each sub-stage is derived analytically from the
+    prescribed ascent/descent speed — no phase-transition logic is applied
+    mid-step. The final phase transition still happens after the full step,
+    identical to the Euler path.
+    """
+
+    def depth_at(frac: float) -> float:
+        if phase == "descending":
+            return min(depth + action.descent_speed_ms * dt * frac,
+                       action.target_depth if action.target_depth is not None else float("inf"))
+        elif phase == "ascending":
+            return max(depth - action.ascent_speed_ms * dt * frac, 0.0)
+        else:
+            return depth
+
+    def vel(frac: float, lat_: float, lon_: float) -> tuple[float, float]:
+        return _query_velocity(interp_u, interp_v, t + timedelta(seconds=dt * frac), depth_at(frac), lat_, lon_)
+
+    def to_deg(u_: float, v_: float, ref_lat: float) -> tuple[float, float]:
+        dlat = v_ * dt / 111320.0
+        dlon = u_ * dt / (111320.0 * math.cos(math.radians(ref_lat)))
+        return dlat, dlon
+
+    u1, v1 = vel(0.0, lat, lon)
+    dlat1, dlon1 = to_deg(u1, v1, lat)
+
+    u2, v2 = vel(0.5, lat + dlat1 / 2, lon + dlon1 / 2)
+    dlat2, dlon2 = to_deg(u2, v2, lat)
+
+    u3, v3 = vel(0.5, lat + dlat2 / 2, lon + dlon2 / 2)
+    dlat3, dlon3 = to_deg(u3, v3, lat)
+
+    u4, v4 = vel(1.0, lat + dlat3, lon + dlon3)
+    dlat4, dlon4 = to_deg(u4, v4, lat)
+
+    dlat = (dlat1 + 2 * dlat2 + 2 * dlat3 + dlat4) / 6
+    dlon = (dlon1 + 2 * dlon2 + 2 * dlon3 + dlon4) / 6
+    dx_m = (u1 + 2 * u2 + 2 * u3 + u4) * dt / 6
+    dy_m = (v1 + 2 * v2 + 2 * v3 + v4) * dt / 6
+
+    return dlat, dlon, dx_m, dy_m
+
 
 def _start_action(action: ControlAction, current_phase: Phase) -> Phase:
     if current_phase == "communicating":

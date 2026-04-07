@@ -140,22 +140,21 @@ def _run_one_cycle(data_dir, action, start_lat=START_LAT, start_lon=START_LON):
 # ── helper: expected drift time for a park-on-bottom cycle ──────
 
 def _expected_drift_seconds_bottom_park(seabed_depth=SEABED_DEPTH):
-    """Analytically compute total time the float is drifting (not on seabed).
+    """Analytically compute total drifting time (transmission + descent + ascent).
 
-    With forward Euler at dt=DT_SECONDS:
-      descent_steps = ceil(seabed_depth / (descent_speed * dt))
-      ascent_steps  = ceil(seabed_depth / (ascent_speed * dt))
-    Plus the transmission window.
+    Uses the actual particle_mover defaults:
+      dt_vertical_seconds=30  for descent/ascent steps
+      dt_surface_seconds=120  for transmission window steps
     """
-    descent_per_step = DESCENT_SPEED * DT_SECONDS
-    ascent_per_step = ASCENT_SPEED * DT_SECONDS
+    dt_vertical = 30.0
+    dt_surface = 120.0
 
-    descent_steps = math.ceil(seabed_depth / descent_per_step)
-    ascent_steps = math.ceil(seabed_depth / ascent_per_step)
+    descent_steps = math.ceil(seabed_depth / (DESCENT_SPEED * dt_vertical))
+    ascent_steps = math.ceil(seabed_depth / (ASCENT_SPEED * dt_vertical))
 
     transmission_s = TRANSMISSION_MINUTES * 60.0
-    descent_s = descent_steps * DT_SECONDS
-    ascent_s = ascent_steps * DT_SECONDS
+    descent_s = descent_steps * dt_vertical
+    ascent_s = ascent_steps * dt_vertical
 
     return transmission_s + descent_s + ascent_s
 
