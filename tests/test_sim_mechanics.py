@@ -33,7 +33,7 @@ from data_loader import (
     select_tiles,
 )
 from particle_mover import run_until_next_action
-from sim_types import ControlAction, ProfilerState
+from sim_types import ControlAction, GeoLocation, ProfilerState
 
 # ── constants ───────────────────────────────────────────────────
 DT_SECONDS = 600.0  # 10-minute timestep (matches default in particle_mover)
@@ -128,8 +128,7 @@ def _run_one_cycle(data_dir, action, start_lat=START_LAT, start_lon=START_LON):
 
     state = ProfilerState(
         time=START_TIME,
-        lat=start_lat,
-        lon=start_lon,
+        location=GeoLocation(lat=start_lat, lon=start_lon),
         depth=0.0,
         phase="communicating",
     )

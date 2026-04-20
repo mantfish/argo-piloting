@@ -36,16 +36,21 @@ ParkMode = Literal["parking_depth", "park_on_bottom", "drift_on_surface"]
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ProfilerState:
-    """Full state of the profiler at a single instant in time."""
-
-    time: datetime
+class GeoLocation:
+    """Position of the profiler in the simulation."""
     lat: float
     lon: float
+
+@dataclass
+class ProfilerState:
+    """Full state of the profiler at a single instant in time."""
+    time: datetime
+    location: GeoLocation
     depth: float        # Positive metres below the surface.
     phase: Phase
-    x: float = 0.0     # Eastward displacement from simulation start (metres).
-    y: float = 0.0     # Northward displacement from simulation start (metres).
+    x: float = 0.0               # Eastward displacement from simulation start (metres).
+    y: float = 0.0               # Northward displacement from simulation start (metres).
+    bathymetry_depth: float = float("nan")  # Local seabed depth in metres, positive down; nan if unknown.
 
 
 @dataclass

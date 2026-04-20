@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from data_loader import build_bathymetry_interpolator, build_velocity_interpolator, load_working_window, select_tiles
-from sim_types import ControlAction, Phase, ProfilerState, TrajectoryRecord
+from sim_types import ControlAction, GeoLocation, Phase, ProfilerState, TrajectoryRecord
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,8 @@ def run_until_next_action(
 
     start_time = state.time
     next_action_time = start_time + timedelta(hours=action.cycle_hours)
-    lat = state.lat
-    lon = state.lon
+    lat = state.location.lat
+    lon = state.location.lon
     depth = state.depth
     x = state.x
     y = state.y
@@ -249,7 +249,7 @@ def run_until_next_action(
             interp_u, interp_v = build_velocity_interpolator(working_ds)
             wlat_min, wlat_max, wlon_min, wlon_max = _win_bounds(lat, lon)
 
-    final_state = ProfilerState(time=time, lat=lat, lon=lon, depth=depth, phase="at_surface", x=x, y=y)
+    final_state = ProfilerState(time=time, location=GeoLocation(lat=lat, lon=lon), depth=depth, phase="at_surface", x=x, y=y, bathymetry_depth=bathy_depth)
     return records, final_state
 
 
@@ -354,7 +354,24 @@ def _step_phase(
     if phase == "descending":
         depth += action.descent_speed_ms * dt_seconds
 
-        if depth >= bathy_depth:
+        # Ascent lookahead: turn around early if there is no longer enough time
+        # to surface by next_action_time.  Only applied for parking_depth — for
+        # park_on_bottom the float is supposed to stay down until it hits the
+        # seabed, so overrunning the clock is intentional there.
+        if (
+            action.park_mode == "parking_depth"
+            and next_action_time is not None
+            and action.ascent_speed_ms is not None
+            and action.ascent_speed_ms > 0
+        ):
+            time_to_ascend_s = depth / action.ascent_speed_ms
+            time_remaining_s = (next_action_time - time).total_seconds()
+            if time_to_ascend_s >= time_remaining_s:
+                phase = "ascending"
+
+        if phase == "ascending":
+            pass  # lookahead fired; skip seabed/target-depth checks
+        elif depth >= bathy_depth:
             depth = bathy_depth
             phase = "on_seabed"
             logger.debug("Float hit seabed at %.1f m; ascent starts %s", depth, next_action_time)
@@ -384,3 +401,134 @@ def _step_phase(
 
 
     return phase, depth
+
+
+def quickly_estimate_next_surface_position(
+    state: ProfilerState,
+    action: ControlAction,
+    forecast,
+    use_rk4: bool = True,
+    assumed_park_depth: float | None = None,
+    dt_vertical_seconds: float = 600.0,
+    dt_parking_seconds: float = 3600.0,
+    dt_surface_seconds: float = 3600.0,
+) -> ProfilerState:
+    """Estimate the float's state after one complete dive cycle.
+
+    Designed to be called hundreds of times inside a control strategy's
+    ``get_action``. Reuses the same RK4/Euler integration math as
+    ``run_until_next_action`` but strips everything else: no tile loading,
+    no trajectory recording, no logging, no window reloading.
+
+    Parameters
+    ----------
+    state:
+        Current float state (position, time, depth). Must have
+        ``phase="communicating"``.
+    action:
+        The control action to evaluate.
+    forecast:
+        Fully computed forecast ``xr.Dataset`` (e.g. from
+        ``get_forecast_field``). Used directly to build velocity
+        interpolators — no tile loading is performed.
+    use_rk4:
+        Use RK4 integration (default). Pass ``sim_config.use_rk4`` here.
+    assumed_park_depth:
+        Depth (m) used as a stand-in seabed for ``park_on_bottom`` actions.
+        Defaults to ``state.bathymetry_depth`` if available, otherwise 2000 m.
+    dt_vertical_seconds:
+        Timestep for descent and ascent phases. Default 600 s (10 min).
+    dt_parking_seconds:
+        Timestep for parking, on_seabed, and surface-drift phases.
+        Default 3600 s (1 hr).
+    dt_surface_seconds:
+        Timestep for the initial surface transmission window. Default 3600 s.
+
+    Returns
+    -------
+    ProfilerState
+        Estimated state when the float next reaches the surface,
+        with ``phase="communicating"``.
+    """
+    if assumed_park_depth is None:
+        assumed_park_depth = (
+            state.bathymetry_depth
+            if not math.isnan(state.bathymetry_depth)
+            else 2000.0
+        )
+
+    interp_u, interp_v = build_velocity_interpolator(forecast)
+
+    lat = state.location.lat
+    lon = state.location.lon
+    depth = state.depth
+    time = state.time
+    x = 0.0
+    y = 0.0
+
+    next_action_time = time + timedelta(hours=action.cycle_hours)
+
+    # --- transmission drift ---
+    transmission_end = time + timedelta(minutes=action.transmission_duration_minutes)
+    while time < transmission_end:
+        dt = min(dt_surface_seconds, (transmission_end - time).total_seconds())
+        if use_rk4:
+            dlat, dlon, dx_m, dy_m = _rk4_horizontal_step(
+                interp_u, interp_v, time, dt, depth, "drift_on_surface", action, lat, lon
+            )
+        else:
+            u, v = _query_velocity(interp_u, interp_v, time, depth, lat, lon)
+            dy_m = v * dt
+            dx_m = u * dt
+            dlat = dy_m / 111320.0
+            dlon = dx_m / (111320.0 * math.cos(math.radians(lat)))
+        lat += dlat
+        lon += dlon
+        x += dx_m
+        y += dy_m
+        time += timedelta(seconds=dt)
+
+    phase = _start_action(action, "communicating")
+
+    # --- main dive loop ---
+    while phase != "communicating":
+        if phase in ("parking", "on_seabed", "drift_on_surface"):
+            dt = dt_parking_seconds
+        else:
+            dt = dt_vertical_seconds
+
+        if use_rk4:
+            dlat, dlon, dx_m, dy_m = _rk4_horizontal_step(
+                interp_u, interp_v, time, dt, depth, phase, action, lat, lon
+            )
+        else:
+            u, v = _query_velocity(interp_u, interp_v, time, depth, lat, lon)
+            dy_m = v * dt
+            dx_m = u * dt
+            dlat = dy_m / 111320.0
+            dlon = dx_m / (111320.0 * math.cos(math.radians(lat)))
+        lat += dlat
+        lon += dlon
+        x += dx_m
+        y += dy_m
+
+        phase, depth = _step_phase(
+            phase=phase, depth=depth, bathy_depth=assumed_park_depth,
+            action=action, time=time, dt_seconds=dt,
+            next_action_time=next_action_time,
+        )
+        time += timedelta(seconds=dt)
+
+        if phase == "on_seabed":
+            time = next_action_time
+            phase = "ascending"
+
+    return ProfilerState(
+        time=time,
+        location=GeoLocation(lat=lat, lon=lon),
+        depth=0.0,
+        phase="communicating",
+        x=state.x + x,
+        y=state.y + y,
+        bathymetry_depth=assumed_park_depth,
+    )

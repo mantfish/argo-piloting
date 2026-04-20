@@ -13,9 +13,15 @@ Static output
 
 Animation
 ---------
-:func:`animate_trajectory` is not yet implemented. It will animate the
-float track overlaid on the current velocity field, with one frame per
-surfacing event.
+:func:`animate_trajectory` saves an MP4 of the track building up over time.
+Each frame advances by a configurable number of records; the title shows the
+current simulation date, phase, and position.
+
+CLI usage::
+
+    python plotter.py <results_dir> <output.mp4> [--fps 10] [--step N]
+
+``results_dir`` must contain exactly one ``.parquet`` trajectory file.
 
 Imports: src/types.py only.
 """
@@ -138,8 +144,8 @@ def plot_trajectory(
     title = (
         f"Strategy: {config.control_strategy}\n"
         f"Start: {config.start_state.time:%Y-%m-%d %H:%M}  |  "
-        f"Lat: {config.start_state.lat:.3f}  "
-        f"Lon: {config.start_state.lon:.3f}\n"
+        f"Lat: {config.start_state.location.lat:.3f}  "
+        f"Lon: {config.start_state.location.lon:.3f}\n"
         f"Forecast noise \u03c3: {config.forecast_noise_std} m/s  |  "
         f"Seed: {config.forecast_noise_seed}"
     )
@@ -159,20 +165,127 @@ def plot_trajectory(
 
 def animate_trajectory(
     df: pd.DataFrame,
-    ds: xr.Dataset,
-    config: SimConfig,
-    save_path: Path | None = None,
+    save_path: Path,
+    fps: int = 10,
+    step: int | None = None,
+    bathy_ds: xr.Dataset | None = None,
 ) -> None:
-    """Animate the float trajectory overlaid on the current velocity field.
+    """Animate the float trajectory and save as an MP4 video.
 
-    Each frame corresponds to one surfacing event. The animation will
-    show the float track building up over time, with background arrows
-    (quiver) drawn from the ``uo`` / ``vo`` fields in *ds* at the
-    matching time slice.
+    The track builds up frame-by-frame, coloured by phase. The title of
+    each frame shows the current simulation date, phase, and position.
+    Requires ``ffmpeg`` to be installed on the system.
 
-    Not yet implemented.
+    Parameters
+    ----------
+    df:
+        Trajectory DataFrame from :func:`load_trajectory`.
+    save_path:
+        Output ``.mp4`` path.
+    fps:
+        Frames per second in the output video. Default 10.
+    step:
+        Records to advance per frame. Defaults to ``len(df) // 200`` so
+        the video is roughly 200 frames regardless of trajectory length.
+    bathy_ds:
+        Optional GEBCO bathymetry dataset for depth shading behind the track.
     """
-    raise NotImplementedError("Animation coming in a later prompt.")
+    from matplotlib.animation import FuncAnimation, FFMpegWriter
+
+    if step is None:
+        step = max(1, len(df) // 200)
+
+    lons = df["lon"].to_numpy()
+    lats = df["lat"].to_numpy()
+    times = pd.to_datetime(df["time"])
+    phases = df["phase"]
+
+    frame_starts = list(range(0, len(df), step))
+    n_frames = len(frame_starts)
+
+    # ------------------------------------------------------------------
+    # Figure and axes
+    # ------------------------------------------------------------------
+    if HAS_CARTOPY:
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+        ax.add_feature(cfeature.LAND, facecolor="lightgrey", zorder=1)
+        ax.coastlines(resolution="10m", linewidth=0.6, zorder=2)
+        gl = ax.gridlines(draw_labels=True, linewidth=0.4, color="grey",
+                          alpha=0.5, linestyle="--")
+        gl.top_labels = False
+        gl.right_labels = False
+        transform = ccrs.PlateCarree()
+    else:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        transform = None
+
+    kw: dict = dict(transform=transform) if transform else {}
+
+    # ------------------------------------------------------------------
+    # Static elements — drawn once before animation starts
+    # ------------------------------------------------------------------
+    if bathy_ds is not None:
+        _draw_bathymetry(ax, bathy_ds, lats, lons)
+
+    ax.plot(lons[0], lats[0], marker="*", markersize=14, color="black", zorder=5, **kw)
+
+    # Fix the view over the full trajectory so the frame never jumps
+    pad = 0.5
+    if transform:
+        ax.set_extent(
+            [lons.min() - pad, lons.max() + pad, lats.min() - pad, lats.max() + pad],
+            crs=transform,
+        )
+    else:
+        ax.set_xlim(lons.min() - pad, lons.max() + pad)
+        ax.set_ylim(lats.min() - pad, lats.max() + pad)
+        ax.set_aspect("equal")
+
+    current_dot, = ax.plot([], [], marker="o", markersize=10, color="black", zorder=7, **kw)
+
+    handles = _phase_legend_handles() + [
+        mlines.Line2D([], [], marker="*", color="black",
+                      linestyle="None", markersize=10, label="Start"),
+        mlines.Line2D([], [], marker="o", color="black",
+                      linestyle="None", markersize=8,  label="Current"),
+    ]
+    ax.legend(handles=handles, fontsize=7, loc="best")
+    title = ax.set_title("")
+
+    # ------------------------------------------------------------------
+    # Per-frame update — appends each new track segment
+    # ------------------------------------------------------------------
+    def _update(frame_i: int):
+        start = frame_starts[frame_i]
+        end = min(start + step, len(df))
+
+        _colour_segments(
+            ax,
+            df["lon"].to_numpy()[start:end],
+            df["lat"].to_numpy()[start:end],
+            phases.iloc[start:end],
+            transform=transform,
+        )
+
+        current_dot.set_data([lons[end - 1]], [lats[end - 1]])
+
+        title.set_text(
+            f"{times.iloc[end - 1]:%Y-%m-%d %H:%M}  |  {phases.iloc[end - 1]}  |  "
+            f"{lats[end - 1]:.3f}°N  {lons[end - 1]:.3f}°E"
+        )
+        return [current_dot, title]
+
+    anim = FuncAnimation(fig, _update, frames=n_frames, interval=1000 // fps, blit=False)
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = FFMpegWriter(fps=fps, metadata={"title": "Profiler trajectory"})
+    anim.save(str(save_path), writer=writer)
+    plt.close(fig)
+    print(f"Saved {n_frames} frames → {save_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +429,45 @@ def _draw_depth_profile(ax, df: pd.DataFrame) -> None:
     ]
     ax.legend(handles=handles, fontsize=7, loc="best")
     ax.set_title("Depth profile")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    parser = argparse.ArgumentParser(
+        description="Animate a profiler simulation trajectory to MP4.",
+    )
+    parser.add_argument(
+        "results_dir", type=Path,
+        help="Folder containing the trajectory .parquet file.",
+    )
+    parser.add_argument(
+        "output", type=Path,
+        help="Output video path, e.g. trajectory.mp4",
+    )
+    parser.add_argument(
+        "--fps", type=int, default=10,
+        help="Frames per second (default: 10)",
+    )
+    parser.add_argument(
+        "--step", type=int, default=None,
+        help="Records per frame (default: auto, ~200 frames total)",
+    )
+    args = parser.parse_args()
+
+    parquet_files = sorted(args.results_dir.glob("*.parquet"))
+    if not parquet_files:
+        print(f"No .parquet files found in {args.results_dir}", file=sys.stderr)
+        sys.exit(1)
+    if len(parquet_files) > 1:
+        print(f"Multiple .parquet files found, using: {parquet_files[0].name}")
+
+    trajectory_df = load_trajectory(parquet_files[0])
+    animate_trajectory(trajectory_df, save_path=args.output, fps=args.fps, step=args.step)

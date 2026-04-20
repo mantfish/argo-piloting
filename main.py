@@ -28,7 +28,7 @@ from control import *
 from data_loader import build_bathymetry_interpolator, get_forecast_field, load_bathymetry, load_manifest, select_tiles
 from particle_mover import run_until_next_action
 from plotter import plot_trajectory
-from sim_types import ControlAction, ProfilerState, SimConfig, TrajectoryRecord
+from sim_types import ControlAction, GeoLocation, ProfilerState, SimConfig, TrajectoryRecord
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +60,7 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
     all_records: list[TrajectoryRecord] = []
     cycle_number = 0
     control = config.control_strategy
+    loaded_action = control.default_action
 
     # ------------------------------------------------------------------
     # Step 3 — Main simulation loop
@@ -72,14 +73,14 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
 
         # Get forecast window for the control decision.
         forecast_end = state.time + timedelta(hours=200)
-        if 200 < control.cycle_hours:
+        if 200 < control.default_action.cycle_hours:
             raise ValueError("Forecast window is too short for the configured control strategy.")
-        forecast_ds = select_tiles(manifest, config.data_dir, state.lat, state.lon, state.time, forecast_end)
+        forecast_ds = select_tiles(manifest, config.data_dir, state.location.lat, state.location.lon, state.time, forecast_end)
 
         forecast = get_forecast_field(
             forecast_ds,
-            lat=state.lat,
-            lon=state.lon,
+            lat=state.location.lat,
+            lon=state.location.lon,
             time=state.time,
             hours_ahead=config.forecast_horizon_hours,
             noise_std=config.forecast_noise_std,
@@ -87,7 +88,7 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
         )
 
         # Ask the control module what to do next.
-        action = control.get_action(
+        next_action = control.get_action(
             profiler_state=state,
             forecast=forecast,
         )
@@ -96,14 +97,14 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
             "Cycle %d | %s | lat=%.4f lon=%.4f depth=%.1fm",
             cycle_number,
             state.time.strftime("%Y-%m-%d %H:%M"),
-            state.lat,
-            state.lon,
+            state.location.lat,
+            state.location.lon,
             state.depth,
         )
 
         # Run particle simulation for one cycle.
         try:
-            records, state = run_until_next_action(state, config.data_dir, manifest, bathy_interp, action, use_rk4=config.use_rk4)
+            records, state = run_until_next_action(state, config.data_dir, manifest, bathy_interp, loaded_action, use_rk4=config.use_rk4)
         except RuntimeError as e:
             logger.warning("Stopping simulation early: %s", e)
             break
@@ -112,21 +113,22 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
         logger.info(
             "  Surfaced at %s | lat=%.4f lon=%.4f",
             state.time.strftime("%Y-%m-%d %H:%M"),
-            state.lat,
-            state.lon,
+            state.location.lat,
+            state.location.lon,
         )
 
         # Simulate surface waiting time before the next action.
         state = ProfilerState(
             time=state.time,
-            lat=state.lat,
-            lon=state.lon,
+            location=state.location,
             depth=0.0,
             phase="communicating",
             x=state.x,
             y=state.y,
+            bathymetry_depth=state.bathymetry_depth,
         )
 
+        loaded_action = next_action
         cycle_number += 1
 
     # ------------------------------------------------------------------
@@ -153,8 +155,8 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
     meta = {
         "forecast_noise_std": config.forecast_noise_std,
         "forecast_noise_seed": config.forecast_noise_seed,
-        "start_lat": config.start_state.lat,
-        "start_lon": config.start_state.lon,
+        "start_lat": config.start_state.location.lat,
+        "start_lon": config.start_state.location.lon,
         "start_time": config.start_state.time.isoformat(),
         "end_time": config.end_time.isoformat(),
     }
@@ -183,15 +185,25 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
 
 if __name__ == "__main__":
     start_state = ProfilerState(
-        time=datetime(2025, 1, 15, 0, 0, 0),
-        lat=55.2,
-        lon=15.5,
+        time=datetime(2023, 10, 2, 0, 0, 0),
+        location=GeoLocation(lat=55.2, lon=15.5),
         depth=0.0,
         phase="communicating",
     )
 
-    #control_strategy = DriftTowardsPoint(target_location=[54.8,14.4], debug=True)
-    control_strategy = NoControlParkOnBottom(cycle_hours=12, debug = True)
+    standard_cycle = ControlAction(
+        park_mode="park_on_bottom",
+        target_depth=50.0,
+        cycle_hours=120,
+        transmission_duration_minutes=30,
+        ascent_speed_ms=0.01,
+        descent_speed_ms=0.01,
+    )
+
+    #control_strategy = DriftTowardsPoint(default_action = standard_cycle, target_location=[54.8,14.4], debug=True)
+    #control_strategy = CircleDrift(default_action = standard_cycle, target_location= [55.2,15.5], radius_km=20, debug = True)
+    control_strategy = CircleMPC(default_action=standard_cycle, target_location=[55.2, 15.5], radius_km=20,
+                                   debug=True)
 
     config = SimConfig(
         start_state=start_state,
@@ -200,8 +212,8 @@ if __name__ == "__main__":
         forecast_noise_std=0.0,
         forecast_noise_seed=42,
         forecast_horizon_hours=120,
-        data_dir=Path("data/test_data"),
-        output_dir=Path("data/processed/test_data"),
+        data_dir=Path("data/raw"),
+        output_dir=Path("data/processed/circle_mpc"),
     )
 
     df = run_simulation(config)
