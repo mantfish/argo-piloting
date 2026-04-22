@@ -15,12 +15,14 @@ import math
 from datetime import datetime
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
 from itertools import product
 
 from sim_types import ControlAction, ControlStrategy, ProfilerState, GeoLocation
 from particle_mover import quickly_estimate_next_surface_position
+from data_loader import build_velocity_interpolator
 
 try:
     import cartopy.crs as ccrs
@@ -781,6 +783,379 @@ class CircleMPC(ControlStrategy):
             "ascent_speed": self.measurement_action.ascent_speed_ms,
             "descent_speed": self.measurement_action.descent_speed_ms,
         }
+
+
+class MPCwithFavourable(ControlStrategy):
+    """Cost-function MPC: minimise distance to target while rewarding favourable flow.
+
+    At each surfacing every candidate action (park mode × depth × duration) is
+    evaluated by predicting the resulting surface position and scoring it with:
+
+        cost = distance_weight × distance_km
+             − final_state_weight × Σ_t (v_forecast(t) · û_toward_target)
+
+    The first term penalises landing far from ``target_location``.
+    The second term rewards positions where the forecast currents over the next
+    ``time_horizon_final_state_hours`` hours point toward the target — i.e. the
+    float will be carried closer even without further active control.
+
+    The action with the lowest cost is executed.
+
+    Parameters
+    ----------
+    default_action:
+        Reference action; provides ascent/descent speeds and transmission
+        duration inherited by all candidate actions.
+    target_location:
+        ``[lat, lon]`` of the target in decimal degrees.
+    radius_km:
+        Informational only — stored for logging; not used in cost function.
+    debug:
+        If ``True``, draws a live map of cycle decisions (requires matplotlib)
+        and emits per-action cost breakdowns via the logger at DEBUG level.
+    """
+
+    def __init__(
+        self,
+        default_action: ControlAction,
+        target_location: list[float],
+        debug: bool = False,
+    ) -> None:
+        self.target_location = GeoLocation(lat=target_location[0], lon=target_location[1])
+        self.measurement_action = default_action
+        self.default_action = default_action
+        self.name = "mpc_with_favourable"
+        self.debug = debug
+        self.last_action = self.measurement_action
+        self._cycle = 0
+
+        # How many hours of forecast flow to sum at the predicted landing position
+        self.time_horizon_final_state_hours = 6
+        # Cost-function weights
+        self.distance_weight = 1
+        self.flow_weight = -0.8*1/self.time_horizon_final_state_hours
+
+
+        mid_depth = 30.0   # metres — mid-water between near-surface (10 m) and bottom
+
+        # Candidate actions: list of dicts with keys park_mode, target_depth, cycle_hours.
+        # Three depth regimes × varying durations to give the optimiser real choice.
+        self._action_configs = [
+            # ── Near-surface: short cycles to exploit surface currents ──────
+            {"park_mode": "parking_depth", "target_depth": 10.0, "cycle_hours":   1},
+            {"park_mode": "parking_depth", "target_depth": 10.0, "cycle_hours":   2},
+            {"park_mode": "parking_depth", "target_depth": 10.0, "cycle_hours":   4},
+            {"park_mode": "parking_depth", "target_depth": 10.0, "cycle_hours":   6},
+            # ── Bottom: slow deep drift, long intervals ───────────────────
+            {"park_mode": "park_on_bottom", "target_depth": None, "cycle_hours":  24},
+            {"park_mode": "park_on_bottom", "target_depth": None, "cycle_hours":  36},
+            {"park_mode": "park_on_bottom", "target_depth": None, "cycle_hours":  48},
+            {"park_mode": "park_on_bottom", "target_depth": None, "cycle_hours":  72},
+            {"park_mode": "park_on_bottom", "target_depth": None, "cycle_hours": 120},
+            # ── Mid-depth: medium drift at ~40 m ──────────────────────────
+            {"park_mode": "parking_depth", "target_depth": mid_depth, "cycle_hours":  8},
+            {"park_mode": "parking_depth", "target_depth": mid_depth, "cycle_hours": 12},
+            {"park_mode": "parking_depth", "target_depth": mid_depth, "cycle_hours": 18},
+            {"park_mode": "parking_depth", "target_depth": mid_depth, "cycle_hours": 36},
+            {"park_mode": "parking_depth", "target_depth": mid_depth, "cycle_hours": 72},
+        ]
+
+        if debug:
+            import matplotlib.lines as mlines
+            import matplotlib.patches as mpatches
+            plt.ion()
+            if HAS_CARTOPY:
+                self.fig = plt.figure(figsize=(14, 10))
+                self.ax = self.fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+                self._transform = ccrs.PlateCarree()
+            else:
+                self.fig, self.ax = plt.subplots(figsize=(14, 10))
+                self._transform = None
+
+    @staticmethod
+    def _action_color(cfg: dict) -> str:
+        if cfg["park_mode"] == "park_on_bottom":
+            return "saddlebrown"
+        if cfg["target_depth"] is not None and cfg["target_depth"] <= 15:
+            return "orange"
+        return "mediumpurple"
+
+    def _build_action(self, cfg: dict) -> ControlAction:
+        return ControlAction(
+            cycle_hours=float(cfg["cycle_hours"]),
+            park_mode=cfg["park_mode"],
+            target_depth=cfg["target_depth"],
+            transmission_duration_minutes=self.measurement_action.transmission_duration_minutes,
+            ascent_speed_ms=self.measurement_action.ascent_speed_ms,
+            descent_speed_ms=self.measurement_action.descent_speed_ms,
+        )
+
+    def predict_next_surface_position(
+        self,
+        profiler_state: ProfilerState,
+        forecast: xr.Dataset,
+        action: ControlAction,
+    ) -> ProfilerState:
+        """Estimate where the float will surface after executing *action*."""
+        return quickly_estimate_next_surface_position(profiler_state, action, forecast)
+
+    def distance_from_center(self, location: GeoLocation) -> float:
+        """Return the distance in km from *location* to ``target_location``."""
+        dlat_m = (location.lat - self.target_location.lat) * 111320.0
+        dlon_m = (location.lon - self.target_location.lon) * 111320.0 * math.cos(
+            math.radians(self.target_location.lat)
+        )
+        return math.sqrt(dlat_m ** 2 + dlon_m ** 2) / 1000.0
+
+    def distance_term(self, action_location, current_location, action: ControlAction) -> float:
+        """Return the cost term for distance to the target."""
+        delta_d = self.distance_from_center(action_location) - self.distance_from_center(current_location)
+        velocity_term = delta_d / action.cycle_hours
+        return self.distance_weight * velocity_term
+
+    def flow_term(
+        self,
+        forecast_interpolators: tuple,
+        predicted_state: ProfilerState,
+    ) -> float:
+        """Sum of surface-current projections toward the target at the predicted position.
+
+        For each hour in ``time_horizon_final_state_hours``, projects the
+        forecast surface velocity onto the unit vector pointing from
+        ``predicted_state.location`` toward ``target_location``. A positive
+        return value means the currents will on average push the float toward
+        the target — i.e. this is a favourable position to land in.
+
+        Parameters
+        ----------
+        forecast_interpolators:
+            ``(interp_u, interp_v)`` from :func:`build_velocity_interpolator`.
+            Each callable takes ``[[t_s, depth_m, lat, lon]]`` and returns an
+            array of velocities in m/s.
+        predicted_state:
+            Float state at the end of the candidate dive (surface, phase=communicating).
+
+        Returns
+        -------
+        float
+            Cumulative dot-product sum (m/s × hours).  Positive = favourable.
+        """
+        from datetime import timedelta as _td
+
+        location = predicted_state.location
+        time     = predicted_state.time
+        interp_u, interp_v = forecast_interpolators
+
+        # Unit vector from predicted position toward target, scaled for metric space.
+        dlat = self.target_location.lat - location.lat
+        dlon = (self.target_location.lon - location.lon) * math.cos(math.radians(location.lat))
+        norm = math.sqrt(dlat ** 2 + dlon ** 2)
+        if norm == 0.0:
+            return 0.0
+        unit_north = dlat / norm   # northward (lat) component
+        unit_east  = dlon / norm   # eastward  (lon) component
+
+        depth_m = 0.5   # first CMEMS depth level — surface currents
+        total = 0.0
+        for i in range(self.time_horizon_final_state_hours):
+            t_s = np.datetime64(time + _td(hours=i), "s").astype(np.float64)
+            u = float(interp_u([[t_s, depth_m, location.lat, location.lon]])[0])
+            v = float(interp_v([[t_s, depth_m, location.lat, location.lon]])[0])
+            if math.isnan(u) or math.isnan(v):
+                continue
+            # u = eastward, v = northward — project onto unit vector toward target
+            total += unit_east * u + unit_north * v
+
+        return total
+
+    def update_debug_plot(
+        self,
+        current: GeoLocation,
+        best_next: GeoLocation,
+        all_candidates: list[tuple[GeoLocation, float, str]],
+        chosen_color: str,
+        action: ControlAction,
+        time: datetime,
+    ) -> None:
+        """Redraw the live map each cycle: future trajectories only, colored by action category."""
+        import matplotlib.lines as mlines
+        import matplotlib.patches as mpatches
+
+        self.ax.cla()
+        kw = dict(transform=self._transform) if self._transform else {}
+
+        if HAS_CARTOPY:
+            self.ax.add_feature(cfeature.LAND, facecolor="lightgrey", zorder=1)
+            self.ax.coastlines(resolution="10m", linewidth=0.6, zorder=2)
+            gl = self.ax.gridlines(draw_labels=True, linewidth=0.4, color="grey", alpha=0.5, linestyle="--")
+            gl.top_labels = False
+            gl.right_labels = False
+        else:
+            self.ax.set_xlabel("Longitude")
+            self.ax.set_ylabel("Latitude")
+
+        # Target
+        self.ax.scatter(
+            self.target_location.lon, self.target_location.lat,
+            color="red", s=150, zorder=8, marker="*", **kw,
+        )
+
+        # Candidate trajectories: thin colored spokes
+        all_lats = [current.lat, best_next.lat, self.target_location.lat]
+        all_lons = [current.lon, best_next.lon, self.target_location.lon]
+        for loc, _cost, color in all_candidates:
+            self.ax.plot(
+                [current.lon, loc.lon], [current.lat, loc.lat],
+                color=color, linewidth=1.2, alpha=0.45, zorder=3, **kw,
+            )
+            self.ax.scatter(loc.lon, loc.lat, color=color, s=25, alpha=0.6, zorder=3, **kw)
+            all_lats.append(loc.lat)
+            all_lons.append(loc.lon)
+
+        # Chosen trajectory: highlighted
+        self.ax.plot(
+            [current.lon, best_next.lon], [current.lat, best_next.lat],
+            color=chosen_color, linewidth=3, zorder=6, **kw,
+        )
+        self.ax.scatter(best_next.lon, best_next.lat, color=chosen_color, s=120, zorder=6, **kw)
+
+        # Current position
+        self.ax.scatter(current.lon, current.lat, color="steelblue", s=80, zorder=7, **kw)
+
+        # Extent
+        pad = 0.3
+        if self._transform:
+            self.ax.set_extent(
+                [min(all_lons) - pad, max(all_lons) + pad,
+                 min(all_lats) - pad, max(all_lats) + pad],
+                crs=self._transform,
+            )
+        else:
+            self.ax.set_xlim(min(all_lons) - pad, max(all_lons) + pad)
+            self.ax.set_ylim(min(all_lats) - pad, max(all_lats) + pad)
+
+        # Legend
+        handles = [
+            mpatches.Patch(color="orange",       label="Surface ~10 m"),
+            mpatches.Patch(color="saddlebrown",  label="Bottom park"),
+            mpatches.Patch(color="mediumpurple", label="Mid ~40 m"),
+            mlines.Line2D([], [], color="steelblue", marker="o", markersize=7,
+                          linestyle="None", label="Current position"),
+            mlines.Line2D([], [], color="red", marker="*", markersize=10,
+                          linestyle="None", label="Target"),
+        ]
+        self.ax.legend(handles=handles, loc="upper left", fontsize=8)
+
+        depth_str = f"{action.target_depth:.0f} m" if action.target_depth is not None else "bottom"
+        self.ax.set_title(
+            f"MPCwithFavourable  |  Cycle {self._cycle}  |  {time.strftime('%Y-%m-%d %H:%M')}\n"
+            f"({current.lat:.3f}°N, {current.lon:.3f}°E)  → {action.park_mode} {depth_str} {action.cycle_hours:.0f}h"
+        )
+        self.fig.canvas.draw()
+        plt.pause(0.05)
+
+    def get_action(self, profiler_state: ProfilerState, forecast: xr.Dataset, **kwargs) -> ControlAction:
+        """Evaluate all candidate actions and return the one with the lowest cost.
+
+        Parameters
+        ----------
+        profiler_state:
+            Current float state (position and time).
+        forecast:
+            Forecast dataset used to simulate candidate dives and evaluate
+            the favourable-flow term.
+        """
+        forecast_interpolators = build_velocity_interpolator(forecast)
+        next_state = self.predict_next_surface_position(profiler_state, forecast, self.last_action)
+        current_distance = self.distance_from_center(next_state.location)
+
+        best_cost    = math.inf
+        best_cfg     = self._action_configs[0]
+        best_state   = None
+        best_dist    = 0.0
+        best_flow    = 0.0
+        all_candidates: list[tuple[GeoLocation, float, str]] = []
+
+        logger.debug(
+            "Cycle %d | lat=%.4f lon=%.4f | evaluating %d candidate actions",
+            self._cycle,
+            profiler_state.location.lat,
+            profiler_state.location.lon,
+            len(self._action_configs),
+        )
+        logger.debug(
+            "  %-14s %-7s %5s | %8s  %-10s | %9s  %-12s | %s",
+            "park_mode", "depth", "hours",
+            "dist_km", "dist_term",
+            "flow_sum", "flow_term",
+            "total_cost",
+        )
+
+        for cfg in self._action_configs:
+            action         = self._build_action(cfg)
+            predicted      = self.predict_next_surface_position(next_state, forecast, action)
+            distance_term  = self.distance_term(predicted.location, next_state.location, action)
+            flow_term      = self.flow_term(forecast_interpolators, predicted)
+            cost           = self.distance_weight * distance_term + self.flow_weight * flow_term
+
+            depth_str = f"{cfg['target_depth']:.0f} m" if cfg["target_depth"] is not None else "bottom"
+            logger.debug(
+                "  %-14s %-7s %5.0fh | %8.2f  %+10.4f | %+9.4f  %+12.4f | %+.4f",
+                cfg["park_mode"], depth_str, cfg["cycle_hours"],
+                distance_term, flow_term,
+                cost,
+            )
+
+            all_candidates.append((predicted.location, cost, self._action_color(cfg)))
+
+            if cost < best_cost:
+                best_cost  = cost
+                best_cfg   = cfg
+                best_state = predicted
+                best_dist  = distance_term
+                best_flow  = flow_term
+
+        chosen_action = self._build_action(best_cfg)
+        self.last_action = chosen_action
+        self._cycle += 1
+
+        depth_str = f"{best_cfg['target_depth']:.0f} m" if best_cfg["target_depth"] is not None else "bottom"
+        logger.info(
+            "Cycle %d | CHOSEN: %s %s %gh | "
+            "dist=%.2f km (term=%+.4f) | "
+            "flow_sum=%+.4f (term=%+.4f) | "
+            "total_cost=%+.4f",
+            self._cycle,
+            best_cfg["park_mode"], depth_str, best_cfg["cycle_hours"],
+            best_dist,  self.distance_weight * best_dist,
+            best_flow, self.flow_weight * best_flow,
+            best_cost,
+        )
+
+        if self.debug:
+            self.update_debug_plot(
+                profiler_state.location,
+                best_state.location,
+                all_candidates,
+                self._action_color(best_cfg),
+                chosen_action,
+                profiler_state.time,
+            )
+
+        return chosen_action
+
+    def get_log(self) -> dict:
+        return {
+            "control_strategy": self.name,
+            "target_location": [self.target_location.lat, self.target_location.lon],
+            "distance_weight": self.distance_weight,
+            "final_state_weight": self.final_state_weight,
+            "time_horizon_final_state_hours": self.time_horizon_final_state_hours,
+            "n_candidate_actions": len(self._action_configs),
+            "ascent_speed": self.measurement_action.ascent_speed_ms,
+            "descent_speed": self.measurement_action.descent_speed_ms,
+        }
+
 
 
 

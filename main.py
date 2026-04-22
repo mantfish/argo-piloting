@@ -202,8 +202,8 @@ if __name__ == "__main__":
 
     #control_strategy = DriftTowardsPoint(default_action = standard_cycle, target_location=[54.8,14.4], debug=True)
     #control_strategy = CircleDrift(default_action = standard_cycle, target_location= [55.2,15.5], radius_km=20, debug = True)
-    control_strategy = CircleMPC(default_action=standard_cycle, target_location=[55.2, 15.5], radius_km=20,
-                                   debug=True)
+    #control_strategy = CircleMPC(default_action=standard_cycle, target_location=[55.2, 15.5], radius_km=20, debug=True)
+    control_strategy = MPCwithFavourable(default_action=standard_cycle, target_location=[55.2, 15.5], debug=True)
 
     config = SimConfig(
         start_state=start_state,
