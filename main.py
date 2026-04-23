@@ -203,7 +203,8 @@ if __name__ == "__main__":
     #control_strategy = DriftTowardsPoint(default_action = standard_cycle, target_location=[54.8,14.4], debug=True)
     #control_strategy = CircleDrift(default_action = standard_cycle, target_location= [55.2,15.5], radius_km=20, debug = True)
     #control_strategy = CircleMPC(default_action=standard_cycle, target_location=[55.2, 15.5], radius_km=20, debug=True)
-    control_strategy = MPCwithFavourable(default_action=standard_cycle, target_location=[55.2, 15.5], debug=True)
+    #control_strategy = MPCwithFavourable(default_action=standard_cycle, target_location=[55.2, 15.5], debug=True)
+    control_strategy = MPCwithFavourableMeasurement(default_action=standard_cycle, target_location=[55.2, 15.5], radius_std_dv=6.0, debug=True)
 
     config = SimConfig(
         start_state=start_state,
@@ -213,7 +214,7 @@ if __name__ == "__main__":
         forecast_noise_seed=42,
         forecast_horizon_hours=120,
         data_dir=Path("data/raw"),
-        output_dir=Path("data/processed/circle_mpc"),
+        output_dir=Path(f"data/processed/{control_strategy.name}"),
     )
 
     df = run_simulation(config)
