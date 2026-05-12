@@ -43,7 +43,7 @@ try:
 except ImportError:
     HAS_CARTOPY = False
 
-from sim_types import SimConfig
+from sim_types import EKFRecord, SimConfig
 
 # ---------------------------------------------------------------------------
 # Phase colour map
@@ -161,6 +161,182 @@ def plot_trajectory(
 
     return fig
 
+
+
+def plot_ekf_statistics(
+    ekf_records: list[EKFRecord],
+    Q: np.ndarray,
+    save_path: Path | None = None,
+    show: bool = False,
+) -> plt.Figure:
+    """Produce a three-panel EKF diagnostic figure.
+
+    Panel 1 — Covariance evolution
+        Sawtooth of position variance trace(P[:2,:2]) across cycles. Each
+        bar shows how much uncertainty grew during the dive (peak = just
+        before GPS fix). After each fix P collapses to zero, so the plot
+        shows the worst-case uncertainty at the moment of surfacing.
+
+    Panel 2 — Innovation time series
+        Innovations v_k = GPS_k − H x̂_{k|k−1} in x (east) and y (north),
+        overlaid with ±2σ bounds derived from P_{k|k−1}. For a well-tuned
+        filter, ~95 % of innovations should fall within these bounds.
+        Running mean is plotted to expose any systematic bias.
+
+    Panel 3 — Normalised Innovation Squared (NIS)
+        NIS_k = vᵀ S⁻¹ v where S = P[:2,:2].  For a 2-D state with R=0
+        this should follow χ²(2) with expected value 2.  The plot shows
+        NIS per cycle alongside the χ²(2) 95 % consistency band [0.10, 7.38]
+        and the theoretical mean.  Values persistently above the band mean
+        Q is too small (filter overconfident); below means Q is too large.
+
+    Parameters
+    ----------
+    ekf_records:
+        List of :class:`EKFRecord` snapshots collected at each surfacing.
+    Q:
+        (4, 4) process noise covariance used during the run (for annotation).
+    save_path:
+        If given, saves the figure here at 150 dpi.
+    show:
+        If True, calls ``plt.show()`` before returning.
+    """
+    if not ekf_records:
+        raise ValueError("ekf_records is empty — nothing to plot.")
+
+    times  = [r.time for r in ekf_records]
+    cycles = [r.cycle for r in ekf_records]
+    vx     = np.array([r.innovation_x for r in ekf_records])
+    vy     = np.array([r.innovation_y for r in ekf_records])
+    Pxx    = np.array([r.P_xx for r in ekf_records])
+    Pyy    = np.array([r.P_yy for r in ekf_records])
+    trace_P = Pxx + Pyy
+
+    # ------------------------------------------------------------------
+    # Figure layout — 3 rows
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(3, 1, figsize=(13, 11), constrained_layout=True)
+    ax1, ax2, ax3 = axes
+
+    # ------------------------------------------------------------------
+    # Panel 1: covariance sawtooth
+    # ------------------------------------------------------------------
+    # Build sawtooth: for each cycle, trace rises from 0 at the start of the
+    # dive to trace_P[k] at the moment of surfacing, then drops to 0 again.
+    saw_t: list = []
+    saw_v: list = []
+    for i, (t, tr) in enumerate(zip(times, trace_P)):
+        if i > 0:
+            saw_t.append(t)
+            saw_v.append(0.0)   # immediately after previous GPS update
+        saw_t.append(t)
+        saw_v.append(tr)        # peak just before this GPS update
+
+    ax1.plot(saw_t, [v / 1e6 for v in saw_v], color="steelblue", linewidth=1.5)
+    ax1.fill_between(saw_t, [v / 1e6 for v in saw_v], alpha=0.18, color="steelblue")
+    ax1.scatter(times, trace_P / 1e6, color="steelblue", s=30, zorder=5,
+                label="peak trace(P) at surfacing")
+    ax1.set_ylabel("trace(P[:2,:2])  (km²)")
+    ax1.set_xlabel("")
+    ax1.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+    ax1.tick_params(axis="x", rotation=30)
+    ax1.legend(fontsize=8)
+    ax1.set_title("Covariance evolution — position uncertainty grows during dive, collapses at GPS fix")
+
+    # ------------------------------------------------------------------
+    # Panel 2: innovation time series with ±2σ and running mean
+    # ------------------------------------------------------------------
+    sigma_x = np.sqrt(np.maximum(Pxx, 0.0))
+    sigma_y = np.sqrt(np.maximum(Pyy, 0.0))
+
+    ax2.axhline(0, color="grey", linewidth=0.8, linestyle="--")
+    ax2.plot(cycles, vx / 1e3, color="tab:blue",   marker="o", markersize=4,
+             linewidth=1.0, label="v_x (east)")
+    ax2.plot(cycles, vy / 1e3, color="tab:orange", marker="s", markersize=4,
+             linewidth=1.0, label="v_y (north)")
+    ax2.fill_between(cycles, -2 * sigma_x / 1e3, 2 * sigma_x / 1e3,
+                     alpha=0.15, color="tab:blue",   label="±2σ_x from P")
+    ax2.fill_between(cycles, -2 * sigma_y / 1e3, 2 * sigma_y / 1e3,
+                     alpha=0.12, color="tab:orange", label="±2σ_y from P")
+
+    # Running mean (cumulative)
+    cum_mean_x = np.cumsum(vx) / np.arange(1, len(vx) + 1)
+    cum_mean_y = np.cumsum(vy) / np.arange(1, len(vy) + 1)
+    ax2.plot(cycles, cum_mean_x / 1e3, color="tab:blue",   linewidth=2.0,
+             linestyle="--", label="running mean v_x")
+    ax2.plot(cycles, cum_mean_y / 1e3, color="tab:orange", linewidth=2.0,
+             linestyle="--", label="running mean v_y")
+
+    ax2.set_ylabel("Innovation  (km)")
+    ax2.set_xlabel("Cycle")
+    ax2.legend(fontsize=7, ncol=3)
+    ax2.set_title(
+        "Innovation v = GPS − H x̂  |  "
+        f"overall mean: ({np.mean(vx)/1e3:+.2f}, {np.mean(vy)/1e3:+.2f}) km"
+    )
+
+    # ------------------------------------------------------------------
+    # Panel 3: Normalised Innovation Squared (NIS) vs χ²(2)
+    # ------------------------------------------------------------------
+    # NIS_k = v^T S^{-1} v  where  S = diag(Pxx, Pyy)  (off-diag pos cov
+    # is zero after GPS reset, and we have independent x/y here)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        nis = np.where(
+            (Pxx > 0) & (Pyy > 0),
+            vx ** 2 / Pxx + vy ** 2 / Pyy,
+            np.nan,
+        )
+
+    chi2_mean = 2.0               # expected value for χ²(2)
+    chi2_lo   = 0.1026            # 2.5th percentile χ²(2)
+    chi2_hi   = 7.3778            # 97.5th percentile χ²(2)
+
+    ax3.axhline(chi2_mean, color="green",  linewidth=1.5, linestyle="-",
+                label=f"χ²(2) mean = {chi2_mean}")
+    ax3.axhline(chi2_lo,   color="green",  linewidth=1.0, linestyle="--",
+                label=f"95 % band [{chi2_lo:.2f}, {chi2_hi:.2f}]")
+    ax3.axhline(chi2_hi,   color="green",  linewidth=1.0, linestyle="--")
+    ax3.fill_between([cycles[0], cycles[-1]], chi2_lo, chi2_hi,
+                     color="green", alpha=0.08)
+
+    ax3.plot(cycles, nis, color="tab:red", marker="o", markersize=4,
+             linewidth=1.0, label="NIS per cycle")
+
+    # Rolling mean over a 5-cycle window
+    if len(nis) >= 3:
+        w = min(5, len(nis))
+        rolling = np.convolve(np.nan_to_num(nis), np.ones(w) / w, mode="valid")
+        ax3.plot(cycles[w - 1:], rolling, color="darkred", linewidth=2.0,
+                 linestyle="--", label=f"{w}-cycle rolling mean")
+
+    overall_mean_nis = float(np.nanmean(nis))
+    ax3.set_ylabel("NIS = vᵀ S⁻¹ v")
+    ax3.set_xlabel("Cycle")
+    ax3.legend(fontsize=8)
+    ax3.set_title(
+        f"Normalised Innovation Squared  |  "
+        f"mean NIS = {overall_mean_nis:.2f}  (target ≈ 2.0)  |  "
+        f"σ_pos = {np.sqrt(Q[0, 0]):.1f} m/√hr"
+    )
+
+    # Annotate tuning guidance
+    if overall_mean_nis > chi2_hi:
+        guidance = "NIS > band → Q too small (filter over-confident), increase σ_pos"
+    elif overall_mean_nis < chi2_lo:
+        guidance = "NIS < band → Q too large (filter under-confident), decrease σ_pos"
+    else:
+        guidance = "NIS within band → filter consistent with Q"
+    ax3.annotate(guidance, xy=(0.02, 0.95), xycoords="axes fraction",
+                 fontsize=8, va="top",
+                 color="green" if chi2_lo <= overall_mean_nis <= chi2_hi else "tab:red")
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    return fig
 
 
 def animate_trajectory(

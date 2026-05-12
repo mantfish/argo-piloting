@@ -5,10 +5,11 @@ file top-to-bottom gives a full picture of the system:
 
   1. Load lazy ocean + bathymetry datasets from NetCDF tiles.
   2. Loop over dive cycles until the configured end time:
-       a. Integrate the float through one descent → park → ascent.
-       b. Get a (possibly noisy) forecast window at the surface.
-       c. Ask the control module for the next ControlAction.
-       d. Advance the clock by the surface waiting time.
+       a. Integrate the float through one descent → park → ascent,
+          applying known bias and process noise to the real state.
+       b. Apply GPS update to the EKF estimated state (R=0).
+       c. Get a (possibly noisy) forecast window at the surface.
+       d. Ask the control module for the next ControlAction.
   3. Collect all TrajectoryRecords into a DataFrame, save to parquet,
      write a JSON config snapshot, and produce a trajectory plot.
 """
@@ -20,15 +21,18 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from control import *
+from control import MPCwithFavourable, MPCwithFavourableMeasurement, MPCwithKalman
 from data_loader import build_bathymetry_interpolator, get_forecast_field, load_bathymetry, load_manifest, select_tiles
+from kalman import gps_update_P, gps_update_X
+from noise import Q_DEFAULT, bias
 from particle_mover import run_until_next_action
-from plotter import plot_trajectory
-from sim_types import ControlAction, GeoLocation, ProfilerState, SimConfig, TrajectoryRecord
+from plotter import plot_ekf_statistics, plot_trajectory
+from sim_types import ControlAction, EKFRecord, GeoLocation, ProfilerState, RealProfilerState, SimConfig, StateVector, TrajectoryRecord
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,8 +60,10 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
     # ------------------------------------------------------------------
     # Step 2 — Initialise
     # ------------------------------------------------------------------
-    state: ProfilerState = config.start_state
+    state: RealProfilerState = config.start_state
+    est_state: ProfilerState = config.est_state
     all_records: list[TrajectoryRecord] = []
+    ekf_records: list[EKFRecord] = []
     cycle_number = 0
     control = config.control_strategy
     loaded_action = control.default_action
@@ -67,7 +73,6 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
     # ------------------------------------------------------------------
     while state.time < config.end_time:
 
-        # Check if simulation is complete.
         if state.time >= config.end_time:
             break
 
@@ -91,20 +96,32 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
         next_action = control.get_action(
             profiler_state=state,
             forecast=forecast,
+            est_state=est_state,
         )
 
         logger.info(
-            "Cycle %d | %s | lat=%.4f lon=%.4f depth=%.1fm",
+            "Cycle %d | %s | lat=%.4f lon=%.4f depth=%.1fm | trace(P[:2,:2])=%.1f m²",
             cycle_number,
             state.time.strftime("%Y-%m-%d %H:%M"),
             state.location.lat,
             state.location.lon,
             state.depth,
+            float(np.trace(est_state.P[:2, :2])),
         )
 
-        # Run particle simulation for one cycle.
+        # Run particle simulation for one cycle (real state + EKF propagation).
         try:
-            records, state = run_until_next_action(state, config.data_dir, manifest, bathy_interp, loaded_action, use_rk4=config.use_rk4)
+            records, state, est_state = run_until_next_action(
+                state,
+                config.data_dir,
+                manifest,
+                bathy_interp,
+                loaded_action,
+                bias_fn=config.bias_fn,
+                Q=config.Q,
+                est_state=est_state,
+                use_rk4=config.use_rk4,
+            )
         except RuntimeError as e:
             logger.warning("Stopping simulation early: %s", e)
             break
@@ -117,8 +134,29 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
             state.location.lon,
         )
 
-        # Simulate surface waiting time before the next action.
-        state = ProfilerState(
+        # GPS update at surface: R=0 — set estimated position exactly from GPS.
+        if est_state is not None:
+            # Record innovation (before update) for filter diagnostics.
+            ekf_records.append(EKFRecord(
+                time=state.time,
+                cycle=cycle_number,
+                innovation_x=state.x - est_state.X.x,
+                innovation_y=state.y - est_state.X.y,
+                P_xx=float(est_state.P[0, 0]),
+                P_yy=float(est_state.P[1, 1]),
+            ))
+            updated_X = gps_update_X(est_state.X, state.x, state.y)
+            updated_P = gps_update_P(est_state.P)
+            est_state = ProfilerState(
+                time=state.time,
+                lat=state.location.lat,
+                lon=state.location.lon,
+                X=updated_X,
+                P=updated_P,
+            )
+
+        # Reset real state phase to communicating for next cycle.
+        state = RealProfilerState(
             time=state.time,
             location=state.location,
             depth=0.0,
@@ -147,11 +185,11 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
     run_dir = config.output_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    parquet_path = run_dir / f"{config.control_strategy}_trajectory.parquet"
+    parquet_path = run_dir / f"{config.control_strategy.name}_trajectory.parquet"
     df.to_parquet(parquet_path)
     logger.info("Trajectory saved to %s", parquet_path)
 
-    meta_path = run_dir / f"{config.control_strategy}_config.json"
+    meta_path = run_dir / f"{config.control_strategy.name}_config.json"
     meta = {
         "forecast_noise_std": config.forecast_noise_std,
         "forecast_noise_seed": config.forecast_noise_seed,
@@ -160,7 +198,7 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
         "start_time": config.start_state.time.isoformat(),
         "end_time": config.end_time.isoformat(),
     }
-    meta = meta | control_strategy.get_log()
+    meta = meta | control.get_log()
     meta_path.write_text(json.dumps(meta, indent=2))
     logger.info("Config saved to %s", meta_path)
 
@@ -170,11 +208,20 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
     plot_trajectory(
         df=df,
         config=config,
-        save_path=run_dir / f"{config.control_strategy}_trajectory.png",
+        save_path=run_dir / f"{config.control_strategy.name}_trajectory.png",
         show=False,
         bathy_ds=bathy_ds,
     )
     logger.info("Plot saved.")
+
+    if ekf_records:
+        plot_ekf_statistics(
+            ekf_records=ekf_records,
+            Q=config.Q,
+            save_path=run_dir / f"{config.control_strategy.name}_ekf_statistics.png",
+            show=False,
+        )
+        logger.info("EKF statistics plot saved.")
 
     return df
 
@@ -184,11 +231,22 @@ def run_simulation(config: SimConfig) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    start_state = ProfilerState(
+    start_real = RealProfilerState(
         time=datetime(2023, 10, 2, 0, 0, 0),
         location=GeoLocation(lat=55.2, lon=15.5),
         depth=0.0,
         phase="communicating",
+        x=0.0,
+        y=0.0,
+    )
+
+    # EKF initial estimate: position known from GPS; bias initialised to true value.
+    start_est = ProfilerState(
+        time=datetime(2023, 10, 2, 0, 0, 0),
+        lat=55.2,
+        lon=15.5,
+        X=StateVector(x=0.0, y=0.0, bx=0.1, by=0.1),
+        P=np.diag([0.0, 0.0, 0.25, 0.25]),  # position known; bias std = 0.5 m/hr
     )
 
     standard_cycle = ControlAction(
@@ -200,19 +258,23 @@ if __name__ == "__main__":
         descent_speed_ms=0.01,
     )
 
-    #control_strategy = DriftTowardsPoint(default_action = standard_cycle, target_location=[54.8,14.4], debug=True)
-    #control_strategy = CircleDrift(default_action = standard_cycle, target_location= [55.2,15.5], radius_km=20, debug = True)
-    #control_strategy = CircleMPC(default_action=standard_cycle, target_location=[55.2, 15.5], radius_km=20, debug=True)
-    control_strategy = MPCwithFavourable(default_action=standard_cycle, target_location=[55.2, 15.5], debug=True)
-    #control_strategy = MPCwithFavourableMeasurement(default_action=standard_cycle, target_location=[55.2, 15.5], radius_std_dv=6.0, debug=True)
+    control_strategy = MPCwithKalman(
+        default_action=standard_cycle,
+        target_location=[55.2, 15.5],
+        debug=True,
+        uncertainty_weight=0.001,
+    )
 
     config = SimConfig(
-        start_state=start_state,
+        start_state=start_real,
+        est_state=start_est,
         end_time=datetime(2025, 1, 24, 0, 0, 0),
         control_strategy=control_strategy,
+        Q=Q_DEFAULT,
+        bias_fn=bias,
         forecast_noise_std=0.0,
         forecast_noise_seed=42,
-        forecast_horizon_hours=120,
+        forecast_horizon_hours=200.0,
         data_dir=Path("data/raw"),
         output_dir=Path(f"data/processed/{control_strategy.name}"),
     )

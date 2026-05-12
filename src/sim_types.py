@@ -10,7 +10,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
+
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -41,8 +43,9 @@ class GeoLocation:
     lat: float
     lon: float
 
+
 @dataclass
-class ProfilerState:
+class RealProfilerState:
     """Full state of the profiler at a single instant in time."""
     time: datetime
     location: GeoLocation
@@ -51,6 +54,25 @@ class ProfilerState:
     x: float = 0.0               # Eastward displacement from simulation start (metres).
     y: float = 0.0               # Northward displacement from simulation start (metres).
     bathymetry_depth: float = float("nan")  # Local seabed depth in metres, positive down; nan if unknown.
+
+
+@dataclass
+class StateVector:
+    """EKF state vector [x, y, bx, by]."""
+    x: float = 0.0    # Eastward displacement from simulation start (metres).
+    y: float = 0.0    # Northward displacement from simulation start (metres).
+    bx: float = 0.0   # Eastward bias (m/hr).
+    by: float = 0.0   # Northward bias (m/hr).
+
+
+@dataclass
+class ProfilerState:
+    """EKF estimated state: Kalman mean and covariance."""
+    time: datetime
+    lat: float          # Current estimated latitude (degrees).
+    lon: float          # Current estimated longitude (degrees).
+    X: StateVector      # State vector [x, y, bx, by].
+    P: np.ndarray       # Covariance matrix, shape (4, 4).
 
 
 @dataclass
@@ -96,12 +118,26 @@ class ControlStrategy(ABC):
 
 
 @dataclass
+class EKFRecord:
+    """Snapshot of EKF state at one surfacing, recorded just before the GPS update."""
+    time: datetime
+    cycle: int
+    innovation_x: float    # GPS_x − est_x (metres, eastward)
+    innovation_y: float    # GPS_y − est_y (metres, northward)
+    P_xx: float            # Position variance x (m²) before GPS update
+    P_yy: float            # Position variance y (m²) before GPS update
+
+
+@dataclass
 class SimConfig:
     """Top-level configuration for a single simulation run."""
 
-    start_state: ProfilerState
+    start_state: RealProfilerState
+    est_state: ProfilerState
     end_time: datetime
-    control_strategy: ControlStrategy       # E.g. "no_control"; used in plot titles and output filenames.
+    control_strategy: ControlStrategy
+    Q: np.ndarray                              # Process noise covariance, shape (4, 4).
+    bias_fn: Callable[[datetime], list[float]] # Known deterministic bias [bx, by] in m/hr.
     forecast_noise_std: float   # Std dev of Gaussian noise added to forecast velocity fields; 0.0 = perfect forecast.
     forecast_noise_seed: int    # Random seed for reproducibility of noise.
     forecast_horizon_hours: float # Forecast horizon in hours.
