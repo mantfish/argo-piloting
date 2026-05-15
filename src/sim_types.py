@@ -36,7 +36,7 @@ class EstimatedState:
     y: float = 0.0
     bx: float = 0.0  # estimated current bias east (m/s)
     by: float = 0.0  # estimated current bias north (m/s)
-    P: np.ndarray = field(default_factory=lambda: np.eye(4) * 1e6)  # 4x4 for [x, y, bx, by]
+    P: np.ndarray = field(default_factory=lambda: np.diag([100.0, 100.0, 1e-4, 1e-4]))  # pos: 10m std; bias: 0.01 m/s std
 
 
 @dataclass

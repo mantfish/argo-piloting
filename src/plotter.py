@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,15 +14,6 @@ from particle_mover import xy_to_latlon
 if TYPE_CHECKING:
     from sim_types import ControlAction, EstimatedState, ProfilerState, SimConfig
 
-# Phase colours for the depth panel
-_PHASE_COLOUR = {
-    "descending": "#4e9af1",
-    "parking": "#888888",
-    "ascending": "#e05c5c",
-    "communicating": "#2ecc71",
-    "on_seabed": "#8B4513",
-}
-
 
 class DebugPlotter:
 
@@ -34,20 +24,27 @@ class DebugPlotter:
         self.target_lon = config.control.target.lon
         self.bias_truth_fn = config.bias_function
 
-        # Per-cycle accumulators (one value per GPS fix)
+        # Per-cycle accumulators (one entry per GPS fix / cycle)
         self._cycles: list[int] = []
-        self._variance_history: list[float] = []
+        self._P_diag_pre:  list[np.ndarray] = []  # diag(P) just BEFORE GPS fix (end of dive)
+        self._P_diag_post: list[np.ndarray] = []  # diag(P) just AFTER  GPS fix
         self._bx_est_history: list[float] = []
         self._by_est_history: list[float] = []
         self._bx_truth_history: list[float] = []
         self._by_truth_history: list[float] = []
+        self._pred_surf_lats: list[float] = []
+        self._pred_surf_lons: list[float] = []
+        self._real_surf_lats: list[float] = []
+        self._real_surf_lons: list[float] = []
+        self._surf_error_x: list[float] = []   # real - predicted east (m)
+        self._surf_error_y: list[float] = []   # real - predicted north (m)
 
         plt.ion()
         self.fig, axes = plt.subplots(2, 3, figsize=(16, 9))
         self.fig.suptitle("Float simulator — live debug", fontsize=12, fontweight="bold")
 
         self.ax_map, self.ax_cand, self.ax_cost = axes[0]
-        self.ax_var, self.ax_bias, self.ax_depth = axes[1]
+        self.ax_var, self.ax_bias, self.ax_surf_error = axes[1]
 
         self._setup_axes()
         plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -58,7 +55,7 @@ class DebugPlotter:
     # ------------------------------------------------------------------
 
     def _setup_axes(self) -> None:
-        self.ax_map.set_title("Trajectory (map)")
+        self.ax_map.set_title("Surfacings (map)")
         self.ax_map.set_xlabel("Longitude")
         self.ax_map.set_ylabel("Latitude")
         self.ax_map.plot(self.target_lon, self.target_lat, "r*", ms=14, label="target", zorder=5)
@@ -75,16 +72,15 @@ class DebugPlotter:
         self.ax_var.set_title("Position variance trace(P_xx)")
         self.ax_var.set_xlabel("Cycle")
         self.ax_var.set_ylabel("Variance (m²)")
-        self.ax_var.set_yscale("log")
 
         self.ax_bias.set_title("Bias estimates vs truth")
         self.ax_bias.set_xlabel("Cycle")
         self.ax_bias.set_ylabel("Bias (m/s)")
 
-        self.ax_depth.set_title("Real float depth")
-        self.ax_depth.set_xlabel("Time")
-        self.ax_depth.set_ylabel("Depth (m)")
-        self.ax_depth.invert_yaxis()
+        self.ax_surf_error.set_title("Surfacing prediction error")
+        self.ax_surf_error.set_xlabel("Cycle")
+        self.ax_surf_error.set_ylabel("Error (m)")
+        self.ax_surf_error.axhline(0, color="black", lw=0.5, alpha=0.3)
 
     # ------------------------------------------------------------------
     # Public update — called once per cycle
@@ -100,25 +96,36 @@ class DebugPlotter:
         estimated_history: list[EstimatedState],
         updated_est: EstimatedState,
     ) -> None:
-        # Accumulate scalar series
+        # Scalar accumulators
         self._cycles.append(cycle)
-        self._variance_history.append(float(np.trace(updated_est.P[:2, :2])))
+        self._P_diag_pre.append(np.diag(chosen_est_traj[-1].P).copy())
+        self._P_diag_post.append(np.diag(updated_est.P).copy())
         self._bx_est_history.append(updated_est.bx)
         self._by_est_history.append(updated_est.by)
         truth = self.bias_truth_fn(updated_est.time)
         self._bx_truth_history.append(truth[0])
         self._by_truth_history.append(truth[1])
 
+        # Surfacing positions: predicted vs actual
+        pred_surf = chosen_est_traj[-1]
+        real_surf = real_traj[-1]
+        self._pred_surf_lats.append(pred_surf.location.lat)
+        self._pred_surf_lons.append(pred_surf.location.lon)
+        self._real_surf_lats.append(real_surf.location.lat)
+        self._real_surf_lons.append(real_surf.location.lon)
+        self._surf_error_x.append(real_surf.x - pred_surf.x)
+        self._surf_error_y.append(real_surf.y - pred_surf.y)
+
         chosen_action = all_action_results[
             min(range(len(all_action_results)), key=lambda i: all_action_results[i][2])
         ][0]
 
-        self._draw_map(real_history, estimated_history, updated_est)
+        self._draw_map(updated_est)
         self._draw_candidates(all_action_results, chosen_action, updated_est)
         self._draw_costs(all_action_results, chosen_action)
         self._draw_variance()
         self._draw_bias()
-        self._draw_depth(real_traj)
+        self._draw_surf_error()
 
         self.fig.canvas.draw_idle()
         plt.pause(0.01)
@@ -127,49 +134,49 @@ class DebugPlotter:
     # Panel drawing helpers
     # ------------------------------------------------------------------
 
-    def _latlon(self, x: float, y: float) -> tuple[float, float]:
-        lat, lon = xy_to_latlon(x, y, self.start_lat, self.start_lon)
-        return lat, lon
-
-    def _draw_map(
-        self,
-        real_history: list[ProfilerState],
-        estimated_history: list[EstimatedState],
-        updated_est: EstimatedState,
-    ) -> None:
+    def _draw_map(self, updated_est: EstimatedState) -> None:
         ax = self.ax_map
         ax.cla()
-        ax.set_title("Trajectory (map)")
+        ax.set_title("Surfacings (map)")
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
+
+        # Light gray line connecting real surfacings in chronological order
+        if len(self._real_surf_lons) > 1:
+            ax.plot(self._real_surf_lons, self._real_surf_lats,
+                    color="#cccccc", lw=0.8, zorder=1)
+
+        # Real surfacings: blue dots
+        ax.scatter(self._real_surf_lons, self._real_surf_lats,
+                   color="#4e9af1", s=50, zorder=3, label="real surface")
+
+        # Predicted surfacings: orange x markers
+        ax.scatter(self._pred_surf_lons, self._pred_surf_lats,
+                   color="#f5a623", s=60, marker="x", linewidths=2,
+                   zorder=4, label="predicted surface")
+
+        # Target
         ax.plot(self.target_lon, self.target_lat, "r*", ms=14, label="target", zorder=5)
 
-        # Real trajectory
-        r_lats = [s.location.lat for s in real_history]
-        r_lons = [s.location.lon for s in real_history]
-        ax.plot(r_lons, r_lats, color="#4e9af1", lw=1.2, label="real", zorder=2)
-
-        # Estimated trajectory
-        e_lats = [s.location.lat for s in estimated_history]
-        e_lons = [s.location.lon for s in estimated_history]
-        ax.plot(e_lons, e_lats, color="#f5a623", lw=1.2, linestyle="--", label="estimated", zorder=2)
-
-        # GPS fix markers (communicating states in real history)
-        fix_lats = [s.location.lat for s in real_history if s.phase == "communicating"]
-        fix_lons = [s.location.lon for s in real_history if s.phase == "communicating"]
-        ax.scatter(fix_lons, fix_lats, color="#4e9af1", s=20, zorder=3)
-
-        # Uncertainty ellipse at current position
+        # Uncertainty ellipse at current estimated position
         self._draw_ellipse(ax, updated_est)
 
         ax.legend(loc="upper left", fontsize=7)
+
+        # Auto-scale to all points + target
+        all_lons = self._real_surf_lons + self._pred_surf_lons + [self.target_lon]
+        all_lats = self._real_surf_lats + self._pred_surf_lats + [self.target_lat]
+        if all_lons:
+            pad_lon = max((max(all_lons) - min(all_lons)) * 0.1, 0.05)
+            pad_lat = max((max(all_lats) - min(all_lats)) * 0.1, 0.05)
+            ax.set_xlim(min(all_lons) - pad_lon, max(all_lons) + pad_lon)
+            ax.set_ylim(min(all_lats) - pad_lat, max(all_lats) + pad_lat)
 
     def _draw_ellipse(self, ax: plt.Axes, state: EstimatedState) -> None:
         P = state.P[:2, :2]
         lat, lon = state.location.lat, state.location.lon
         lat_rad = math.radians(lat)
 
-        # 1σ radii in degrees
         lon_std = math.sqrt(max(P[0, 0], 0.0)) / (111_000.0 * math.cos(lat_rad))
         lat_std = math.sqrt(max(P[1, 1], 0.0)) / 111_000.0
 
@@ -202,7 +209,6 @@ class DebugPlotter:
             lw = 1.8 if is_chosen else 0.8
             alpha = 1.0 if is_chosen else 0.6
             ax.plot(lons, lats, color=colour, lw=lw, alpha=alpha, zorder=3 if is_chosen else 2)
-            # Label at endpoint
             label = f"{action.parking_depth:.0f}m/{action.duration_hours:.0f}h\nc={cost:.1f}"
             ax.annotate(label, (lons[-1], lats[-1]), fontsize=6, color=colour,
                         textcoords="offset points", xytext=(3, 3))
@@ -211,7 +217,6 @@ class DebugPlotter:
         ax.plot(self.target_lon, self.target_lat, "r*", ms=10, zorder=5, label="target")
         ax.legend(loc="upper left", fontsize=7)
 
-        # Zoom to ~2° around current position
         margin = 1.0
         ax.set_xlim(cur_lon - margin, cur_lon + margin)
         ax.set_ylim(cur_lat - margin, cur_lat + margin)
@@ -239,15 +244,48 @@ class DebugPlotter:
     def _draw_variance(self) -> None:
         ax = self.ax_var
         ax.cla()
-        ax.set_title("Position variance trace(P_xx)")
+        ax.set_title("P diagonal — pre/post GPS fix (log scale)")
         ax.set_xlabel("Cycle")
-        ax.set_ylabel("Variance (m²)")
-        if self._variance_history:
-            ax.set_yscale("log")
-        ax.step(self._cycles, self._variance_history, where="post",
-                color="#4e9af1", lw=1.5)
-        if self._variance_history:
-            ax.scatter(self._cycles, self._variance_history, s=20, color="#4e9af1", zorder=3)
+        ax.set_ylabel("Variance")
+
+        if not self._cycles:
+            return
+
+        labels  = ["x pos (m²)", "y pos (m²)", "bx ((m/s)²)", "by ((m/s)²)"]
+        colours = ["#4e9af1",     "#1a6dcc",     "#f5a623",      "#c47d00"]
+        styles  = ["-",           "--",           "-",            "--"]
+
+        pre  = np.array(self._P_diag_pre)   # (n, 4)
+        post = np.array(self._P_diag_post)  # (n, 4)
+
+        # Build interleaved x-axis: pre at c-0.35, post at c+0.35.
+        # Connecting post(n) → pre(n+1) shows growth during the next dive;
+        # connecting pre(n) → post(n) shows the collapse at the GPS fix.
+        for j, (label, colour, style) in enumerate(zip(labels, colours, styles)):
+            xs, ys = [], []
+            for i, c in enumerate(self._cycles):
+                xs.extend([c - 0.35, c + 0.35])
+                ys.extend([pre[i, j], post[i, j]])
+            ax.plot(xs, ys, color=colour, lw=1.4, linestyle=style,
+                    marker="o", ms=4, label=label)
+
+        ax.set_yscale("log")
+        ax.set_xticks(self._cycles)
+
+        # "pre" / "post" tick labels on a second x-axis so integers stay clean
+        ax.set_xticklabels([str(c) for c in self._cycles], fontsize=7)
+
+        # Vertical dashed lines between pre and post within each cycle
+        for c in self._cycles:
+            ax.axvline(c, color="gray", lw=0.4, linestyle=":", alpha=0.5)
+
+        # Annotate first cycle so reader knows which is which
+        if len(self._cycles) >= 1:
+            ax.text(self._cycles[0], 1, "←pre  post→",
+                    fontsize=6, color="gray", ha="center", va="bottom",
+                    transform=ax.get_xaxis_transform())
+
+        ax.legend(loc="upper right", fontsize=7)
 
     def _draw_bias(self) -> None:
         ax = self.ax_bias
@@ -264,35 +302,21 @@ class DebugPlotter:
         ax.axhline(0, color="black", lw=0.5, alpha=0.3)
         ax.legend(loc="upper left", fontsize=7)
 
-    def _draw_depth(self, real_traj: list[ProfilerState]) -> None:
-        ax = self.ax_depth
+    def _draw_surf_error(self) -> None:
+        ax = self.ax_surf_error
         ax.cla()
-        ax.set_title("Real float depth (current cycle)")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Depth (m)")
-        ax.invert_yaxis()
+        ax.set_title("Surfacing prediction error")
+        ax.set_xlabel("Cycle")
+        ax.set_ylabel("Error (m)")
+        ax.axhline(0, color="black", lw=0.5, alpha=0.3)
 
-        if len(real_traj) < 2:
-            return
+        dist = [math.sqrt(dx ** 2 + dy ** 2)
+                for dx, dy in zip(self._surf_error_x, self._surf_error_y)]
 
-        times = [s.time for s in real_traj]
-        depths = [s.depth for s in real_traj]
-        phases = [s.phase for s in real_traj]
-
-        for i in range(len(real_traj) - 1):
-            colour = _PHASE_COLOUR.get(phases[i], "#cccccc")
-            ax.plot([times[i], times[i + 1]], [depths[i], depths[i + 1]],
-                    color=colour, lw=1.5)
-
-        # Legend patches
-        seen = set(phases)
-        patches = [mpatches.Patch(color=_PHASE_COLOUR.get(p, "#cccccc"), label=p)
-                   for p in _PHASE_COLOUR if p in seen]
-        if patches:
-            ax.legend(handles=patches, loc="lower right", fontsize=6)
-
-        ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%H:%M"))
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=7)
+        ax.plot(self._cycles, self._surf_error_x, color="#4e9af1", lw=1.5, label="dx east")
+        ax.plot(self._cycles, self._surf_error_y, color="#2ecc71", lw=1.5, label="dy north")
+        ax.plot(self._cycles, dist, color="black", lw=1.5, linestyle="--", label="|error|")
+        ax.legend(loc="upper left", fontsize=7)
 
     # ------------------------------------------------------------------
     # Save

@@ -12,8 +12,8 @@ import numpy as np
 # For a 1-hour step: position noise std = sqrt(Q_pos * 3600) = 50 m  ✓
 #                    bias noise std     = sqrt(Q_bias * 3600) = 0.001 m/s  ✓
 
-_SIGMA_POS  = 50.0 / 60.0          # m/sqrt(s)
-_SIGMA_BIAS = 0.001 / 60.0         # (m/s)/sqrt(s)
+_SIGMA_POS  = 120.0 / 60.0          # m/sqrt(s)
+_SIGMA_BIAS = 0.5 / 60.0         # (m/s)/sqrt(s)
 
 Q_DEFAULT: np.ndarray = np.diag([
     _SIGMA_POS  ** 2,   # x    (m²/s)
@@ -23,6 +23,15 @@ Q_DEFAULT: np.ndarray = np.diag([
 ])
 
 
-def bias(t: datetime) -> list[float]:
+def constant_bias(t: datetime) -> list[float]:
     """Known deterministic current bias [bx, by] in m/s."""
-    return [0.0, 0.0]
+    return [0.02, -0.05]
+
+_BIAS_PERIOD_S = 10 * 24 * 3600  # 10 days in seconds
+_EPOCH = datetime(2000, 1, 1)     # arbitrary fixed reference
+
+def bias(t: datetime) -> list[float]:
+    """Sinusoidal current bias with a 10-day period, in m/s."""
+    elapsed = (t - _EPOCH).total_seconds()
+    phase = 2 * np.pi * elapsed / _BIAS_PERIOD_S
+    return [0.1*np.sin(phase), 0.1* np.cos(phase)]

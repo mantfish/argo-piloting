@@ -70,7 +70,12 @@ def run_simulation(config: SimConfig):
         location=config.start_location,
         depth=0.0,
         phase="communicating",
-        P=np.eye(4) * 1e4,
+        P=np.diag([
+            100.0 ** 2,  # x std = 100 m
+            100.0 ** 2,  # y std = 100 m
+            0.05 ** 2,  # bx std = 5 cm/s
+            0.05 ** 2,  # by std = 5 cm/s
+        ])
     )
 
     real_history: list[ProfilerState] = [real_state]
@@ -98,14 +103,15 @@ def run_simulation(config: SimConfig):
         best_est_history: list[EstimatedState] = []
         all_action_results: list[tuple] = []
 
+        best_subcosts: tuple = ()
         for action in config.control.possible_actions:
             est_traj = simulate_estimate_forward(
                 current_est, action, interp_u, interp_v,
                 bathy_interp, config.process_noise,
                 start_lat, start_lon, config.dt,
             )
-            cost = config.control.evaluate_cost(
-                est_traj[-1], action, interp_u, interp_v, start_lat, start_lon,
+            cost, flow, dist, sci, var = config.control.evaluate_cost(
+                est_traj[-1], current_real, action, interp_u, interp_v, start_lat, start_lon,
             )
             all_action_results.append((action, est_traj, cost))
             logger.debug("  action depth=%.0f dur=%.0f h  cost=%.3f",
@@ -114,9 +120,15 @@ def run_simulation(config: SimConfig):
                 best_cost = cost
                 best_action = action
                 best_est_history = est_traj
+                best_subcosts = (flow, dist, sci, var)
 
-        logger.info("  chosen: depth=%.0f m  dur=%.0f h  cost=%.3f",
-                    best_action.parking_depth, best_action.duration_hours, best_cost)
+        flow, dist, sci, var = best_subcosts
+        logger.info(
+            "  chosen: depth=%.0f m  dur=%.0f h  "
+            "cost=%.4f  [flow=%.4f  dist=%.4f  sci=%.4f  var=%.4f]",
+            best_action.parking_depth, best_action.duration_hours,
+            best_cost, flow, dist, sci, var,
+        )
 
         # Simulate real float
         real_traj = simulate_real(
@@ -179,8 +191,9 @@ if __name__ == "__main__":
         target_location=[55.2, 15.5],  # somewhere in the Baltic dataset
         flow_weight=-0.8,
         distance_weight=1.0,
-        science_weight=1.0,
-        variance_weight=1e-9,
+        science_weight=0*1.0,
+        variance_weight=100,
+        radius_std_m=8000
     )
     config = SimConfig(
         start_time=datetime(2023, 10, 1),
@@ -192,6 +205,6 @@ if __name__ == "__main__":
         data_dir=Path("./data/raw"),
         time_end=datetime(2025, 1, 24),
         control=control,
-        dt=3600.0,
+        dt=300.0,
     )
     run_simulation(config)

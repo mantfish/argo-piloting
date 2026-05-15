@@ -60,13 +60,15 @@ class KFMPC:
         for h in range(self.time_horizon_hours):
             t = state.time + timedelta(hours=h)
             u, v = _query_uv(state.x, state.y, 0.0, t, interp_u, interp_v, start_lat, start_lon)
-            ux += u
-            uy += v
-        return float(np.dot(np.array([ux, uy]), n))
+            ux += u + state.bx
+            uy += v + state.by
+        return float(np.dot(np.array([ux, uy]), n))/(self.time_horizon_hours)
 
-    def _distance_term(self, state: EstimatedState, start_lat: float, start_lon: float) -> float:
+    def _distance_term(self, current_state, previous_state, action, start_lat, start_lon):
         target_x, target_y = self._target_xy(start_lat, start_lon)
-        return math.sqrt((state.x - target_x) ** 2 + (state.y - target_y) ** 2)
+        d_current = math.sqrt((current_state.x - target_x) ** 2 + (current_state.y - target_y) ** 2)
+        d_prev = math.sqrt((previous_state.x - target_x) ** 2 + (previous_state.y - target_y) ** 2)
+        return (d_current - d_prev) / (action.duration_hours*3600)
 
     def _science_term(self, state: EstimatedState, action: ControlAction,
                       start_lat: float, start_lon: float) -> float:
@@ -76,28 +78,32 @@ class KFMPC:
         return proximity * action.science_cost
 
     def _variance_term(self, state: EstimatedState) -> float:
-        return float(np.trace(state.P[:2, :2]))
+        return math.sqrt(float(np.trace(state.P[:2, :2])))
 
     def evaluate_cost(
         self,
         final_state: EstimatedState,
+        prev_real_state: EstimatedState,
         action: ControlAction,
         interp_u: Callable,
         interp_v: Callable,
         start_lat: float,
         start_lon: float,
-    ) -> float:
+    ) -> tuple[float, float, float, float, float]:
+        """Returns (total, flow_term, distance_term, science_term, variance_term)."""
         flow = self._flow_term(final_state, interp_u, interp_v, start_lat, start_lon)
-        distance = self._distance_term(final_state, start_lat, start_lon)
+        distance = self._distance_term(current_state=final_state, previous_state=prev_real_state, action=action, start_lat=start_lat, start_lon=start_lon)
         science = self._science_term(final_state, action, start_lat, start_lon)
         variance = self._variance_term(final_state)
 
-        return (
-            self.flow_weight * flow
+        total = (
+            - self.flow_weight * flow
             + self.distance_weight * distance
-            - self.science_weight * science
+            + self.science_weight * science
             + self.variance_weight * variance
         )
+        print(final_state.P)
+        return total, flow, distance, science, variance
 
     def export_parameters(self) -> dict:
         return {

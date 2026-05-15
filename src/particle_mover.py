@@ -98,14 +98,14 @@ def simulate_estimate_forward(
         if not parked_on_bottom:
             u, v = _query_uv(state.x, state.y, state.depth, state.time,
                               interp_u, interp_v, start_lat, start_lon)
+            F = _compute_jacobian(state.x, state.y, state.depth, state.time,
+                                  interp_u, interp_v, start_lat, start_lon)  # pre-step
             state.x += (u + state.bx) * dt
             state.y += (v + state.by) * dt
-
-            # Covariance propagation (EKF continuous-discrete)
-            F = _compute_jacobian(state.x, state.y, state.depth, state.time,
-                                   interp_u, interp_v, start_lat, start_lon)
-            Pdot = F @ state.P + state.P @ F.T + Q
-            state.P = state.P + Pdot * dt
+            # Exact discrete propagation: always maintains PSD (Euler form does not).
+            # Valid because |F*dt| << 1 for typical ocean gradients and dt=3600s.
+            Phi = np.eye(4) + F * dt
+            state.P = Phi @ state.P @ Phi.T + Q * dt
 
         state.time += timedelta(seconds=dt)
         state.location = GeoLocation(*xy_to_latlon(state.x, state.y, start_lat, start_lon))
