@@ -78,8 +78,8 @@ class KFMPC:
         return proximity * action.science_cost
 
     def _variance_term(self, state: EstimatedState) -> float:
-        return math.sqrt(float(np.trace(state.P[:2, :2])))
-
+        return float(np.trace(state.P[2:, 2:]))
+    
     def evaluate_cost(
         self,
         final_state: EstimatedState,

@@ -27,11 +27,11 @@ def constant_bias(t: datetime) -> list[float]:
     """Known deterministic current bias [bx, by] in m/s."""
     return [0.02, -0.05]
 
-_BIAS_PERIOD_S = 10 * 24 * 3600  # 10 days in seconds
+_BIAS_PERIOD_S = 40 * 24 * 3600  # 10 days in seconds
 _EPOCH = datetime(2000, 1, 1)     # arbitrary fixed reference
 
 def bias(t: datetime) -> list[float]:
     """Sinusoidal current bias with a 10-day period, in m/s."""
     elapsed = (t - _EPOCH).total_seconds()
     phase = 2 * np.pi * elapsed / _BIAS_PERIOD_S
-    return [0.1*np.sin(phase), 0.1* np.cos(phase)]
+    return [0.2*np.sin(phase), 0.2* np.cos(phase)]

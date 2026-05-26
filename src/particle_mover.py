@@ -106,6 +106,11 @@ def simulate_estimate_forward(
             # Valid because |F*dt| << 1 for typical ocean gradients and dt=3600s.
             Phi = np.eye(4) + F * dt
             state.P = Phi @ state.P @ Phi.T + Q * dt
+        else:
+            # Float is stationary so position and cross-covariance don't evolve,
+            # but bias keeps drifting in the real world regardless
+            state.P[2, 2] += Q[2, 2] * dt
+            state.P[3, 3] += Q[3, 3] * dt
 
         state.time += timedelta(seconds=dt)
         state.location = GeoLocation(*xy_to_latlon(state.x, state.y, start_lat, start_lon))
@@ -165,6 +170,7 @@ def simulate_real(
             noise = rng.multivariate_normal(np.zeros(2), Q[:2, :2] * dt)
             state.x += (u + bias[0]) * dt + noise[0]
             state.y += (v + bias[1]) * dt + noise[1]
+
 
         state.time += timedelta(seconds=dt)
         state.location = GeoLocation(*xy_to_latlon(state.x, state.y, start_lat, start_lon))

@@ -17,17 +17,17 @@ if TYPE_CHECKING:
 
 class DebugPlotter:
 
-    def __init__(self, config: SimConfig, start_lat: float, start_lon: float) -> None:
+    def __init__(self, config: SimConfig, start_lat: float, start_lon: float, W: int = 10) -> None:
         self.start_lat = start_lat
         self.start_lon = start_lon
         self.target_lat = config.control.target.lat
         self.target_lon = config.control.target.lon
         self.bias_truth_fn = config.bias_function
+        self.W = W
 
         # Per-cycle accumulators (one entry per GPS fix / cycle)
         self._cycles: list[int] = []
-        self._P_diag_pre:  list[np.ndarray] = []  # diag(P) just BEFORE GPS fix (end of dive)
-        self._P_diag_post: list[np.ndarray] = []  # diag(P) just AFTER  GPS fix
+        self._nis_history: list[float] = []
         self._bx_est_history: list[float] = []
         self._by_est_history: list[float] = []
         self._bx_truth_history: list[float] = []
@@ -69,9 +69,9 @@ class DebugPlotter:
         self.ax_cost.set_xlabel("Action")
         self.ax_cost.set_ylabel("Cost (lower = better)")
 
-        self.ax_var.set_title("Position variance trace(P_xx)")
+        self.ax_var.set_title(f"NIS (W={self.W}) — Q monitoring")
         self.ax_var.set_xlabel("Cycle")
-        self.ax_var.set_ylabel("Variance (m²)")
+        self.ax_var.set_ylabel("NIS")
 
         self.ax_bias.set_title("Bias estimates vs truth")
         self.ax_bias.set_xlabel("Cycle")
@@ -95,11 +95,12 @@ class DebugPlotter:
         real_history: list[ProfilerState],
         estimated_history: list[EstimatedState],
         updated_est: EstimatedState,
+        *,
+        nis: float,
     ) -> None:
         # Scalar accumulators
         self._cycles.append(cycle)
-        self._P_diag_pre.append(np.diag(chosen_est_traj[-1].P).copy())
-        self._P_diag_post.append(np.diag(updated_est.P).copy())
+        self._nis_history.append(nis)
         self._bx_est_history.append(updated_est.bx)
         self._by_est_history.append(updated_est.by)
         truth = self.bias_truth_fn(updated_est.time)
@@ -123,7 +124,7 @@ class DebugPlotter:
         self._draw_map(updated_est)
         self._draw_candidates(all_action_results, chosen_action, updated_est)
         self._draw_costs(all_action_results, chosen_action)
-        self._draw_variance()
+        self._draw_nis()
         self._draw_bias()
         self._draw_surf_error()
 
@@ -241,49 +242,65 @@ class DebugPlotter:
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                     f"{cost:.2f}", ha="center", va="bottom", fontsize=7)
 
-    def _draw_variance(self) -> None:
+    @staticmethod
+    def _chi2_ppf(p: float, k: int) -> float:
+        """Chi-squared quantile: exact for k=2, Wilson-Hilferty approximation otherwise."""
+        import math
+        if k == 2:
+            return -2.0 * math.log(1.0 - p)
+        z = -1.9600 if p < 0.5 else 1.9600
+        return k * (1.0 - 2.0 / (9 * k) + z * math.sqrt(2.0 / (9 * k))) ** 3
+
+    def _draw_nis(self) -> None:
         ax = self.ax_var
         ax.cla()
-        ax.set_title("P diagonal — pre/post GPS fix (log scale)")
+        ax.set_title(f"NIS (W={self.W}) — Q monitoring")
         ax.set_xlabel("Cycle")
-        ax.set_ylabel("Variance")
+        ax.set_ylabel("NIS")
 
         if not self._cycles:
             return
 
-        labels  = ["x pos (m²)", "y pos (m²)", "bx ((m/s)²)", "by ((m/s)²)"]
-        colours = ["#4e9af1",     "#1a6dcc",     "#f5a623",      "#c47d00"]
-        styles  = ["-",           "--",           "-",            "--"]
+        nis = np.array(self._nis_history)
+        cycles = np.array(self._cycles)
 
-        pre  = np.array(self._P_diag_pre)   # (n, 4)
-        post = np.array(self._P_diag_post)  # (n, 4)
+        # Individual NIS values
+        ax.scatter(cycles, nis, color="#aaaaaa", s=25, zorder=3, label="NIS per cycle")
 
-        # Build interleaved x-axis: pre at c-0.35, post at c+0.35.
-        # Connecting post(n) → pre(n+1) shows growth during the next dive;
-        # connecting pre(n) → post(n) shows the collapse at the GPS fix.
-        for j, (label, colour, style) in enumerate(zip(labels, colours, styles)):
-            xs, ys = [], []
-            for i, c in enumerate(self._cycles):
-                xs.extend([c - 0.35, c + 0.35])
-                ys.extend([pre[i, j], post[i, j]])
-            ax.plot(xs, ys, color=colour, lw=1.4, linestyle=style,
-                    marker="o", ms=4, label=label)
+        # Rolling mean over last W observations
+        if len(nis) >= self.W:
+            roll_cycles = cycles[self.W - 1:]
+            roll_mean = np.array([nis[i - self.W + 1: i + 1].mean()
+                                  for i in range(self.W - 1, len(nis))])
+            ax.plot(roll_cycles, roll_mean, color="#4e9af1", lw=2.0,
+                    zorder=4, label=f"rolling mean (W={self.W})")
+
+            # CI band for rolling mean: chi2(2W)/W
+            lo_mean = self._chi2_ppf(0.025, 2 * self.W) / self.W
+            hi_mean = self._chi2_ppf(0.975, 2 * self.W) / self.W
+            ax.fill_between(roll_cycles, lo_mean, hi_mean,
+                            color="#4e9af1", alpha=0.15, zorder=1)
+
+        # Expected value (dof=2 → mean=2)
+        ax.axhline(2.0, color="black", lw=1.0, linestyle="--", alpha=0.7, label="E[NIS]=2")
+
+        # Single-obs 95% bounds from chi2(2): exact closed form
+        lo_single = self._chi2_ppf(0.025, 2)   # ≈ 0.051
+        hi_single = self._chi2_ppf(0.975, 2)   # ≈ 7.378
+        ax.axhline(hi_single, color="#e74c3c", lw=0.8, linestyle=":",
+                   alpha=0.6, label=f"95% single ({hi_single:.2f})")
+        ax.axhline(lo_single, color="#e74c3c", lw=0.8, linestyle=":", alpha=0.6)
 
         ax.set_yscale("log")
-        ax.set_xticks(self._cycles)
+        if self._cycles:
+            ax.set_xticks(cycles)
+            ax.set_xticklabels([str(c) for c in cycles], fontsize=7)
 
-        # "pre" / "post" tick labels on a second x-axis so integers stay clean
-        ax.set_xticklabels([str(c) for c in self._cycles], fontsize=7)
-
-        # Vertical dashed lines between pre and post within each cycle
-        for c in self._cycles:
-            ax.axvline(c, color="gray", lw=0.4, linestyle=":", alpha=0.5)
-
-        # Annotate first cycle so reader knows which is which
-        if len(self._cycles) >= 1:
-            ax.text(self._cycles[0], 1, "←pre  post→",
-                    fontsize=6, color="gray", ha="center", va="bottom",
-                    transform=ax.get_xaxis_transform())
+        # Annotation explaining Q-monitoring interpretation
+        ax.text(0.01, 0.97,
+                "mean > band → Q too small\nmean < band → Q too large",
+                transform=ax.transAxes, fontsize=6, color="#555555",
+                va="top", ha="left")
 
         ax.legend(loc="upper right", fontsize=7)
 

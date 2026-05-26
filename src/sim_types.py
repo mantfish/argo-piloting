@@ -47,6 +47,22 @@ class ControlAction:
     ascent_speed_ms: float = 0.01    # m/s, positive upward
     descent_speed_ms: float = 0.01  # m/s, positive downward
 
+# Used in notebooks
+@dataclass
+class TrajectoryRecord:
+    """One row in the recorded trajectory — maps directly to a DataFrame column."""
+
+    time: datetime
+    lat: float
+    lon: float
+    x: float                    # Eastward displacement from simulation start (metres).
+    y: float                    # Northward displacement from simulation start (metres).
+    depth: float                # Positive metres below the surface.
+    phase: Phase
+    u: float                    # Eastward current at this point (m/s); float("nan") if unavailable.
+    v: float                    # Northward current at this point (m/s); float("nan") if unavailable.
+    bathymetry_depth: float     # Local seabed depth in metres, positive down; float("nan") if unavailable.
+    on_seabed: bool
 
 @dataclass
 class SimConfig:

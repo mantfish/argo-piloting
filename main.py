@@ -148,6 +148,7 @@ def run_simulation(config: SimConfig):
 
         innovation = np.array([surf_real.x - surf_est.x, surf_real.y - surf_est.y])
         P_XX_inv = np.linalg.inv(P_XX + np.eye(2) * 1e-10)
+        nis = float(innovation @ P_XX_inv @ innovation)
         bias_correction = P_bX @ P_XX_inv @ innovation
 
         updated = EstimatedState(
@@ -172,7 +173,8 @@ def run_simulation(config: SimConfig):
 
         if plotter:
             plotter.update(cycle, real_traj, best_est_history,
-                           all_action_results, real_history, estimated_history, updated)
+                           all_action_results, real_history, estimated_history, updated,
+                           nis=nis)
 
     logger.info("Simulation complete. %d real states, %d estimated states.",
                 len(real_history), len(estimated_history))
@@ -189,10 +191,10 @@ def run_simulation(config: SimConfig):
 if __name__ == "__main__":
     control = KFMPC(
         target_location=[55.2, 15.5],  # somewhere in the Baltic dataset
-        flow_weight=-0.8,
-        distance_weight=1.0,
-        science_weight=0*1.0,
-        variance_weight=100,
+        flow_weight=10,
+        distance_weight=10,
+        science_weight=10,
+        variance_weight=1/30,
         radius_std_m=8000
     )
     config = SimConfig(
