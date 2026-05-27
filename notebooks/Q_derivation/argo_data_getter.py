@@ -2,7 +2,8 @@ import argopy
 from argopy import DataFetcher as ArgoDataFetcher
 import os
 
-WMO = 7902194  # replace with your float WMO number
+WMO = 1902682
+# replace with your float WMO number
 
 print(f"Fetching all data for float {WMO}...")
 

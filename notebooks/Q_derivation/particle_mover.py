@@ -371,6 +371,10 @@ def _step_phase(
 
         if phase == "ascending":
             pass  # lookahead fired; skip seabed/target-depth checks
+        elif math.isnan(bathy_depth) and action.park_mode == "park_on_bottom":
+            raise RuntimeError(
+                f"park_on_bottom cannot find seabed: bathy_depth is NaN at depth={depth:.1f} m"
+            )
         elif depth >= bathy_depth:
             depth = bathy_depth
             phase = "on_seabed"
